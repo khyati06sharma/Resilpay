@@ -1,0 +1,158 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ResilPay | Self-Healing Payroll</title>
+
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 30px;
+            background: #f3f5f9;
+            color: #202b3c;
+            font-family: Arial, sans-serif;
+        }
+
+        header, section {
+            max-width: 1000px;
+            margin: 0 auto 22px;
+        }
+
+        header p { color: #65738a; }
+
+        .card {
+            background: white;
+            padding: 22px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 3px 14px #18243b0c;
+        }
+
+        .amount {
+            font-size: 30px;
+            font-weight: bold;
+            color: #315be8;
+        }
+
+        .status { color: #16794b; font-weight: bold; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th, td {
+            padding: 12px 8px;
+            border-bottom: 1px solid #e8ebf0;
+        }
+
+        input, button {
+            padding: 11px;
+            margin: 5px 3px 5px 0;
+            border: 1px solid #d6dce6;
+            border-radius: 6px;
+        }
+
+        button {
+            background: #315be8;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+
+        .table-wrap { overflow-x: auto; }
+
+        @media (max-width: 600px) {
+            body { padding: 15px; }
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <h1>ResilPay</h1>
+        <p>Self-Healing Payroll Management System</p>
+    </header>
+
+    <section class="card">
+        <h2>Payroll Overview</h2>
+        <p>Total monthly basic salary</p>
+        <div class="amount">₹{{ "%.2f"|format(total_salary) }}</div>
+        <p class="status">● Application dashboard loaded</p>
+        <p><a href="/health" target="_blank">Check system health</a></p>
+    </section>
+
+    <section class="card">
+        <h2>Employee Directory</h2>
+
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Department</th>
+                        <th>Basic Salary</th>
+                    </tr>
+                </thead>
+
+                <tbody>
+                    {% for employee in employees %}
+                    <tr>
+                        <td>{{ employee.name }}</td>
+                        <td>{{ employee.department }}</td>
+                        <td>₹{{ "%.2f"|format(employee.basic_salary) }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="3">No employees found.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Add Employee</h2>
+
+        <form action="/add-employee" method="POST">
+            <input name="name" placeholder="Employee name" required>
+            <input name="department" placeholder="Department" required>
+            <input name="salary" type="number" min="0.01"
+                   step="0.01" placeholder="Monthly basic salary" required>
+            <button type="submit">Add Employee</button>
+        </form>
+    </section>
+
+    <section class="card">
+        <h2>Recent Incidents</h2>
+        <p>Self-healing incident history will appear here.</p>
+
+        {% if incidents %}
+        <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>Failure</th>
+                    <th>Details</th>
+                    <th>Recovery</th>
+                    <th>Time</th>
+                </tr>
+                {% for incident in incidents %}
+                <tr>
+                    <td>{{ incident.failure_type }}</td>
+                    <td>{{ incident.message }}</td>
+                    <td>{{ incident.recovery_status }}</td>
+                    <td>{{ incident.recovery_time }} s</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        {% else %}
+        <p>No incidents recorded yet.</p>
+        {% endif %}
+    </section>
+</body>
+</html>
