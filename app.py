@@ -53,6 +53,10 @@ def set_recovery_stage(kind, stage, message, incident_id=None, started_at=None):
             "incident_id": incident_id if incident_id is not None else old.get("incident_id"),
             "started_at": started_at if started_at is not None else old.get("started_at"),
             "updated_at": now(), "active": stage not in ("recovered", "failed"),
+            "finished_at": now() if stage in ("recovered", "failed") else None,
+            "target_duration_seconds": RECOVERY_DEMO_TARGET_SECONDS,
+            "minimum_demo_window_seconds": 15,
+            "maximum_demo_window_seconds": 30,
             "history": (old.get("history", []) + [{"stage": stage, "label": _RECOVERY_STAGES[stage_index][1], "at": now(), "message": message}])[-12:],
         }
 
@@ -60,7 +64,7 @@ def set_recovery_failure(kind, message):
     with _recovery_status_lock:
         old = _recovery_status.get(kind, {})
         _recovery_status[kind] = {**old, "stage": "failed", "stage_label": "Recovery needs attention",
-            "message": message, "active": False, "updated_at": now(),
+            "message": message, "active": False, "finished_at": now(), "updated_at": now(),
             "history": (old.get("history", []) + [{"stage": "failed", "label": "Recovery needs attention", "at": now(), "message": message}])[-12:]}
 
 
@@ -68,7 +72,24 @@ def set_recovery_failure(kind, message):
 # The delays are retry intervals, not a command to mark recovery successful.
 # A fault is cleared only after the recovery policy has exhausted its probes,
 # followed by explicit post-recovery health verification.
-RECOVERY_BACKOFF_SECONDS = (1, 2, 4, 8, 8)  # ~23 seconds before corrective action
+RECOVERY_BACKOFF_SECONDS = (1, 1, 1)  # quick diagnostic probes; corrective actions run independently of the display timer
+RECOVERY_DEMO_TARGET_SECONDS = 20  # display only; never used to declare a recovery successful
+
+def wait_for_minimum_demo_window(started_at, minimum_seconds=15):
+    """Keep the lifecycle visible for a demo window after real recovery work.
+
+    This is presentation pacing only. It never clears a fault and never
+    changes a failed verification into success.
+    """
+    try:
+        start = datetime.fromisoformat(started_at)
+        elapsed = (datetime.now().astimezone() - start).total_seconds()
+    except (TypeError, ValueError):
+        elapsed = 0
+    remaining = max(0.0, minimum_seconds - elapsed)
+    if remaining:
+        threading.Event().wait(remaining)
+
 
 def recovery_backoff_probe(probe, label):
     """Probe a failing dependency with bounded exponential backoff.
@@ -429,6 +450,83 @@ def update_salary(employee_id):
         conn.close()
 
 
+@app.route("/employees/<int:employee_id>", methods=["PUT"])
+def update_employee(employee_id):
+    data = request.get_json(silent=True) or {}
+
+    name = str(data.get("name", "")).strip()
+    department = str(data.get("department", "")).strip()
+
+    try:
+        salary = float(data.get("basic_salary", data.get("salary", 0)))
+        if not name or not department or not (0 < salary < float("inf")):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify(
+            error="Name, department and a positive basic salary are required."
+        ), 400
+
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE employees
+            SET name = ?, department = ?, basic_salary = ?
+            WHERE id = ?
+            """,
+            (name, department, salary, employee_id),
+        )
+
+        if cur.rowcount == 0:
+            return jsonify(error="Employee not found."), 404
+
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM employees WHERE id = ?",
+            (employee_id,),
+        ).fetchone()
+
+        return jsonify(
+            message="Employee updated successfully.",
+            employee=employee_dict(row),
+        )
+    finally:
+        conn.close()
+
+
+@app.route("/employees/<int:employee_id>", methods=["DELETE"])
+def delete_employee(employee_id):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM employees WHERE id = ?",
+            (employee_id,),
+        ).fetchone()
+
+        if not row:
+            return jsonify(error="Employee not found."), 404
+
+        # Retain payment/audit history. Do not silently delete an employee
+        # who already has financial records.
+        payment = conn.execute(
+            "SELECT id FROM payments WHERE employee_id = ? LIMIT 1",
+            (employee_id,),
+        ).fetchone()
+
+        if payment:
+            return jsonify(
+                error="This employee has payment history and cannot be deleted. "
+                      "Keep the record for audit safety."
+            ), 409
+
+        conn.execute("DELETE FROM employees WHERE id = ?", (employee_id,))
+        conn.commit()
+
+        return jsonify(message="Employee deleted successfully.")
+    finally:
+        conn.close()
+
+
 @app.route("/recovery-queue", methods=["GET"])
 def recovery_queue_status():
     return jsonify(summary=queue_summary(), items=queue_items())
@@ -500,8 +598,27 @@ def network_status():
 
 @app.route("/recovery-status", methods=["GET"])
 def recovery_status():
+    # Compute elapsed/remaining display values at request time. These are UI
+    # telemetry only: they do not clear faults or mark a recovery successful.
     with _recovery_status_lock:
         items = {key: dict(value) for key, value in _recovery_status.items()}
+    current = datetime.now().astimezone()
+    for item in items.values():
+        # Freeze elapsed time at the terminal transition. A completed lifecycle
+        # must never keep ticking after Recovered/Failed is shown.
+        endpoint_time = current
+        if not item.get("active") and item.get("finished_at"):
+            try:
+                endpoint_time = datetime.fromisoformat(item["finished_at"])
+            except (TypeError, ValueError):
+                endpoint_time = current
+        try:
+            started = datetime.fromisoformat(item.get("started_at"))
+            elapsed = max(0, int((endpoint_time - started).total_seconds()))
+        except (TypeError, ValueError):
+            elapsed = int(item.get("elapsed_seconds", 0) or 0)
+        item["elapsed_seconds"] = elapsed
+        item["remaining_seconds"] = 0 if not item.get("active") else max(0, int(item.get("target_duration_seconds", RECOVERY_DEMO_TARGET_SECONDS)) - elapsed)
     return jsonify({"recoveries": items, "stages": [
         {"id": item[0], "label": item[1]} for item in _RECOVERY_STAGES
     ]})
@@ -575,7 +692,7 @@ def chaos_network():
             checks["verification_error"] = str(exc)
 
         set_recovery_stage("network", "verifying", "Running health and dashboard checks after the corrective action.", incident_id)
-        threading.Event().wait(1.5)
+        wait_for_minimum_demo_window(incident_started, 15)
         verified = checks.get("/health") == 200 and checks.get("/dashboard-data") == 200
         incident_finish(
             incident_id,
@@ -693,7 +810,7 @@ def chaos_other(kind):
             checks["verification_error"] = str(exc)
 
         set_recovery_stage(kind, "verifying", "Checking backend health and confirming the fault flag is cleared.", incident_id)
-        threading.Event().wait(1.5)
+        wait_for_minimum_demo_window(started, 15)
         try:
             incident_finish(
                 incident_id, started,
@@ -791,7 +908,7 @@ def chaos_database():
             verification_message = f"SQLite recovery verification failed: {exc}"
 
         set_recovery_stage("database", "verifying", "Checking SELECT 1 and reading employee count to verify database health.", incident_id)
-        threading.Event().wait(1.5)
+        wait_for_minimum_demo_window(incident_started, 15)
         try:
             incident_finish(
                 incident_id,
@@ -824,57 +941,118 @@ def chaos_database():
     }), 202
 
 
+
 def make_payment(employee_id, run_id):
-    """Create or return a transaction using a stable idempotency key."""
+    """Create or return one payment per employee per payroll period."""
     key = f"resilpay-{run_id}-{employee_id}"
     conn = get_db()
-    try:
-        existing = conn.execute(
-            "SELECT * FROM payments WHERE idempotency_key=?", (key,)
-        ).fetchone()
-        if existing:
-            return dict(existing), False
 
-        emp = conn.execute(
-            "SELECT * FROM employees WHERE id=?", (employee_id,)
+    try:
+        # A PAID transaction for this period always wins, even if a caller
+        # accidentally supplies a different run ID.
+        already_paid = conn.execute(
+            """
+            SELECT * FROM payments
+            WHERE employee_id = ?
+              AND payroll_period = ?
+              AND status = 'PAID'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (employee_id, run_id),
         ).fetchone()
-        if not emp:
+
+        if already_paid:
+            return dict(already_paid), False
+
+        existing = conn.execute(
+            "SELECT * FROM payments WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()
+
+        if existing:
+            existing = dict(existing)
+
+            # This simulator's FAILED state explicitly means the provider
+            # confirmed no payment. Retry the same row/key after recovery.
+            if existing["status"] == "FAILED" and not _chaos.get("payment", False):
+                conn.execute(
+                    """
+                    UPDATE payments
+                    SET status = 'PAID',
+                        message = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'FAILED'
+                    """,
+                    (
+                        "Retry confirmed after provider recovery; original transaction reused.",
+                        now(),
+                        existing["id"],
+                    ),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM payments WHERE id = ?",
+                    (existing["id"],),
+                ).fetchone()
+                return dict(row), True
+
+            return existing, False
+
+        emp_row = conn.execute(
+            "SELECT * FROM employees WHERE id = ?",
+            (employee_id,),
+        ).fetchone()
+
+        if not emp_row:
             raise LookupError("Employee not found.")
 
-        emp = employee_dict(emp)
+        emp = employee_dict(emp_row)
         amount = emp["net_salary"]
+
         if amount <= 0:
             raise ValueError("Net payable must be positive.")
 
-        # Do not create a Paid transaction when the simulated provider
-        # is unavailable. Record a failed attempt and signal the recovery worker.
-        if _chaos["payment"]:
+        provider_failed = bool(_chaos.get("payment", False))
+        if provider_failed:
             _payment_fault_observed.set()
-        status = "FAILED" if _chaos["payment"] else "PAID"
+
+        status = "FAILED" if provider_failed else "PAID"
         message = (
-            "Simulated provider failure; no payment confirmed."
-            if status == "FAILED"
+            "Simulated provider failure; no payment was confirmed."
+            if provider_failed
             else "Simulated provider confirmed payment."
         )
 
         cur = conn.execute(
-            """INSERT INTO payments
-               (employee_id, employee_name, amount, idempotency_key,
-                status, message, updated_at, payroll_period)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """
+            INSERT INTO payments
+                (employee_id, employee_name, amount, idempotency_key,
+                 status, message, updated_at, payroll_period)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
-                employee_id, emp["name"], amount, key,
-                status, message, now(), run_id,
+                employee_id,
+                emp["name"],
+                amount,
+                key,
+                status,
+                message,
+                now(),
+                run_id,
             ),
         )
         conn.commit()
+
         row = conn.execute(
-            "SELECT * FROM payments WHERE id=?", (cur.lastrowid,)
+            "SELECT * FROM payments WHERE id = ?",
+            (cur.lastrowid,),
         ).fetchone()
+
         return dict(row), True
+
     finally:
         conn.close()
-
 
 @app.route("/payments/employee/<int:employee_id>", methods=["POST"])
 def pay_employee(employee_id):
@@ -904,11 +1082,13 @@ def pay_employee(employee_id):
         duplicate_prevented=not created,
     ), 200
 
+# Use the current payroll period by default, not a new random ID per click.
 
 @app.route("/payments/run", methods=["POST"])
 def payments_run():
     data = request.get_json(silent=True) or {}
-    run_id = str(data.get("run_id") or uuid.uuid4())
+    run_id = str(data.get("run_id") or datetime.now().strftime("%Y-%m"))
+    #run_id = str(data.get("run_id") or uuid.uuid4())
     employee_ids = data.get("employee_ids")
 
     conn = get_db()
@@ -936,13 +1116,13 @@ def payments_run():
 
     failed = sum(p["status"] != "PAID" for p in results)
     return jsonify(
-        message="Simulated payroll run finished; inspect individual statuses.",
-        run_id=run_id,
-        payments=results,
-        failed_count=failed,
-        paid_count=len(results) - failed,
-        real_money_transferred=False,
-    ), 200
+    message="Simulated payroll run finished; inspect individual statuses.",
+    run_id=run_id,
+    payments=results,
+    failed_count=failed,
+    paid_count=len(results) - failed,
+    real_money_transferred=False,
+), (503 if failed else 200)
 
 
 @app.route("/payments")

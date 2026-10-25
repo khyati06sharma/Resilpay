@@ -468,6 +468,16 @@ function App() {
                         <p style={{ minHeight: 40, margin: 0, fontSize: 12, lineHeight: 1.5, color: "var(--muted, #756a6d)" }}>
                           {recovery?.message || "Run this failure in Chaos Lab to watch each recovery stage update live."}
                         </p>
+                        {recovery?.started_at && <div style={{ marginTop: 10, padding: "9px 10px", borderRadius: 8, background: "rgba(141,48,72,.07)", border: "1px solid rgba(141,48,72,.16)" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 }}>
+                            <strong>Recovery timer</strong>
+                            <span>{recovery.elapsed_seconds ?? 0}s elapsed{recovery.active ? ` · ${recovery.remaining_seconds ?? 0}s to 20s target` : " · finished"}</span>
+                          </div>
+                          <div style={{ height: 5, marginTop: 7, borderRadius: 99, overflow: "hidden", background: "var(--border, #e5dfe1)" }}>
+                            <div style={{ height: "100%", width: `${Math.min(100, ((recovery.elapsed_seconds ?? 0) / 20) * 100)}%`, background: recovery.stage === "recovered" ? "#3d8660" : recovery.stage === "failed" ? "#b33a42" : "#8d3048", transition: "width .4s ease" }} />
+                          </div>
+                          <small style={{ display: "block", marginTop: 5, opacity: .75 }}>Timing display only — recovery depends on corrective actions and health verification.</small>
+                        </div>}
                         {recovery?.started_at && <small style={{ display: "block", marginTop: 8, opacity: 0.7 }}>Started: {formatDate(recovery.started_at)}</small>}
                       </article>
                     );
@@ -533,6 +543,7 @@ function App() {
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}><strong>{item.title}</strong><Badge status={recovery?.stage === "recovered" ? "healthy" : recovery?.stage === "failed" ? "failed" : recovery?.active ? "warning" : "neutral"}>{recovery?.stage_label || "Idle"}</Badge></div>
                       <div style={{ display: "grid", gridTemplateColumns: "repeat(5,minmax(0,1fr))", gap: 5, margin: "14px 0 10px" }}>{labels.map((label, index) => <div key={label} title={label} style={{ height: 6, borderRadius: 99, background: currentIndex >= index ? "#8d3048" : "var(--border, #e5dfe1)", opacity: currentIndex >= index ? 0.85 : 0.5 }} />)}</div>
                       <p style={{ minHeight: 40, margin: 0, fontSize: 12, lineHeight: 1.5, color: "var(--muted, #756a6d)" }}>{recovery?.message || "Run this test to watch its recovery stages."}</p>
+                      {recovery?.started_at && <div style={{ marginTop: 10, padding: "9px 10px", borderRadius: 8, background: "rgba(141,48,72,.07)", border: "1px solid rgba(141,48,72,.16)" }}><div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 }}><strong>Recovery timer</strong><span>{recovery.elapsed_seconds ?? 0}s elapsed{recovery.active ? ` · ${recovery.remaining_seconds ?? 0}s to 20s target` : " · finished"}</span></div><div style={{ height: 5, marginTop: 7, borderRadius: 99, overflow: "hidden", background: "var(--border, #e5dfe1)" }}><div style={{ height: "100%", width: `${Math.min(100, ((recovery.elapsed_seconds ?? 0) / 20) * 100)}%`, background: recovery.stage === "recovered" ? "#3d8660" : recovery.stage === "failed" ? "#b33a42" : "#8d3048", transition: "width .4s ease" }} /></div><small style={{ display: "block", marginTop: 5, opacity: .75 }}>Timer is for display only; the backend must complete recovery checks.</small></div>}
                     </article>;
                   })}
                 </div>
