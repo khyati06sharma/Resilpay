@@ -15,9 +15,9 @@ _database_fault_duration = None
 _database_fault_observed = threading.Event()
 
 
-def wait_for_database_fault_observed():
-    """Block the recovery worker until a real database operation hits the fault."""
-    _database_fault_observed.wait()
+def wait_for_database_fault_observed(timeout=8):
+    """Wait for a real database request to encounter the injected fault."""
+    return _database_fault_observed.wait(timeout=timeout)
 
 
 def activate_database_fault(duration=None):

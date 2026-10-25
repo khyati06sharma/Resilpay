@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ShieldCheck, PanelLeftClose, PanelLeftOpen, LayoutDashboard,
   Users, Calculator, CreditCard, Activity, Plus, RefreshCw,
@@ -9,14 +9,30 @@ import {
 import './App.css';
 
 const API = '/api';
+const POLL_INTERVAL = 2000;
 
-const money = (n) =>
-  '₹' + Number(n || 0).toLocaleString('en-IN', {
+const money = (value) =>
+  '₹' + Number(value || 0).toLocaleString('en-IN', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
   });
 
 const period = () => new Date().toISOString().slice(0, 7);
+
+const emptyQueueSummary = {
+  pending: 0,
+  queued: 0,
+  processing: 0,
+  completed: 0,
+  failed: 0,
+  needs_reconciliation: 0
+};
+
+const emptyEmployeeForm = {
+  name: '',
+  department: '',
+  salary: ''
+};
 
 async function readJson(response) {
   const data = await response.json().catch(() => ({}));
@@ -47,23 +63,22 @@ async function writeJson(url, method, body) {
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
-
   return readJson(response);
 }
 
-const emptyQueueSummary = {
-  pending: 0,
-  queued: 0,
-  processing: 0,
-  completed: 0,
-  failed: 0
-};
+function faultIsActive(status) {
+  return Boolean(status?.active);
+}
 
-const emptyEmployeeForm = {
-  name: '',
-  department: '',
-  salary: ''
-};
+function recoveryIsBlocking(recovery) {
+  return Boolean(
+    recovery?.active ||
+    ['detecting', 'analyzing', 'working', 'verifying'].includes(
+      recovery?.stage
+    ) ||
+    recovery?.stage === 'failed'
+  );
+}
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -77,12 +92,24 @@ export default function App() {
   });
 
   const [loading, setLoading] = useState(true);
+  const [backendDisconnected, setBackendDisconnected] = useState(true);
   const [error, setError] = useState('');
-  const [apiUnavailable, setApiUnavailable] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [incidentNotice, setIncidentNotice] = useState('');
+
   const [apiStatus, setApiStatus] = useState({
     active: false,
-    status: 'healthy'
+    status: 'unknown'
   });
+  const [networkStatus, setNetworkStatus] = useState({
+    active: false,
+    status: 'unknown'
+  });
+  const [databaseStatus, setDatabaseStatus] = useState({
+    active: false,
+    status: 'unknown'
+  });
+  const [recoveryStatus, setRecoveryStatus] = useState({ recoveries: {} });
 
   const [cacheInfo, setCacheInfo] = useState({
     cached: false,
@@ -92,12 +119,8 @@ export default function App() {
   const [queueInfo, setQueueInfo] = useState(emptyQueueSummary);
   const [queueItems, setQueueItems] = useState([]);
 
-  const [notice, setNotice] = useState('');
-  const [incidentNotice, setIncidentNotice] = useState('');
-
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState(null);
-
   const [showForm, setShowForm] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState(null);
 
@@ -116,130 +139,156 @@ export default function App() {
   const refreshInProgress = useRef(false);
   const previousIncidentStates = useRef(null);
   const previousApiActive = useRef(null);
-  const mounted = useRef(false);
 
-  // Refresh shared backend state, including incidents and queued operations.
-  // Do not run overlapping refreshes.
+  const networkRecovery = recoveryStatus?.recoveries?.network;
+  const databaseRecovery = recoveryStatus?.recoveries?.database;
+  const apiRecovery = recoveryStatus?.recoveries?.api;
+
+  // A network fault blocks writes until recovery is verified.
+  // Database/API faults do not disable eligible write actions: those requests
+  // must reach Flask so it can persist them in the recovery queue.
+  const networkBlocked = Boolean(
+    backendDisconnected ||
+    faultIsActive(networkStatus) ||
+    recoveryIsBlocking(networkRecovery)
+  );
+
+  const databaseFault = faultIsActive(databaseStatus);
+  const apiFault = faultIsActive(apiStatus);
+
   const refresh = useCallback(async () => {
     if (refreshInProgress.current) return;
-
     refreshInProgress.current = true;
 
     try {
-      const [dashboardResult, statusResult, queueResult] =
-        await Promise.all([
-          safeGet(`${API}/dashboard-data`),
-          safeGet(`${API}/api-status`).catch(() => ({
-            active: false,
-            status: 'unknown'
-          })),
-          safeGet(`${API}/recovery-queue`).catch(() => ({
-            items: [],
-            summary: emptyQueueSummary
-          }))
-        ]);
+      // Fetch monitoring endpoints independently. A database fault should not
+      // prevent the UI from seeing status and submitting queueable operations.
+      const [
+        dashboardResult,
+        apiResult,
+        networkResult,
+        databaseResult,
+        recoveryResult,
+        queueResult
+      ] = await Promise.all([
+        safeGet(`${API}/dashboard-data`).catch((e) => ({ fetchError: e })),
+        safeGet(`${API}/api-status`).catch(() => null),
+        safeGet(`${API}/network-status`).catch(() => null),
+        safeGet(`${API}/database-status`).catch(() => null),
+        safeGet(`${API}/recovery-status`).catch(() => null),
+        safeGet(`${API}/recovery-queue`).catch(() => null)
+      ]);
 
-      const incomingIncidents = dashboardResult.incidents || [];
-      const incidentMap = new Map(
-        incomingIncidents.map(item => [
-          String(item.id),
-          item.recovery_status
-        ])
+      const monitoringAvailable = Boolean(
+        apiResult && networkResult && databaseResult && recoveryResult
       );
 
-      // Detect new incidents and recovery transitions in the shared incident
-      // list, including failures triggered from the Control Center.
-      if (previousIncidentStates.current !== null) {
-        const previous = previousIncidentStates.current;
+      setBackendDisconnected(!monitoringAvailable);
 
-        const newest = [...incomingIncidents].sort(
-          (a, b) => Number(b.id) - Number(a.id)
-        )[0];
+      if (apiResult) {
+        const active = Boolean(apiResult.active);
 
-        if (newest && !previous.has(String(newest.id))) {
-          setIncidentNotice(
-            `Failure detected: ${newest.failure_type}. ` +
-            'Automatic recovery has started.'
-          );
-          setNotice('');
-        } else if (
-          newest &&
-          previous.has(String(newest.id)) &&
-          previous.get(String(newest.id)) !== newest.recovery_status
+        if (
+          previousApiActive.current !== null &&
+          previousApiActive.current !== active
         ) {
-          if (newest.recovery_status === 'Recovered') {
+          if (active) {
+            setIncidentNotice(
+              'API fault detected. Eligible operations can be queued while monitoring remains available.'
+            );
+            setNotice('');
+          } else {
             setNotice(
-              `Recovery completed: ${newest.failure_type}. ` +
-              'The backend recorded a verified recovery.'
+              'API fault cleared. Check the recovery queue for final operation results.'
             );
             setIncidentNotice('');
-            setError('');
-          } else if (
-            ['Unrecovered', 'Failed'].includes(newest.recovery_status)
-          ) {
-            setIncidentNotice(
-              `Recovery needs attention: ${newest.failure_type}. ` +
-              'Check the incident timeline.'
-            );
           }
         }
+
+        previousApiActive.current = active;
+        setApiStatus(apiResult);
       }
 
-      previousIncidentStates.current = incidentMap;
+      if (networkResult) setNetworkStatus(networkResult);
+      if (databaseResult) setDatabaseStatus(databaseResult);
+      if (recoveryResult) setRecoveryStatus(recoveryResult);
 
-      const apiIsActive = Boolean(statusResult?.active);
-
-      if (
-        previousApiActive.current !== null &&
-        previousApiActive.current !== apiIsActive
-      ) {
-        if (apiIsActive) {
-          setIncidentNotice(
-            'API failure detected. API-dependent operations may be rejected or queued.'
-          );
-          setNotice('');
-        } else {
-          setNotice(
-            'API connection restored. Check the queue and transaction history.'
-          );
-          setIncidentNotice('');
-        }
+      if (queueResult) {
+        setQueueItems(queueResult.items || []);
+        setQueueInfo({
+          ...emptyQueueSummary,
+          ...(queueResult.summary || {})
+        });
       }
 
-      previousApiActive.current = apiIsActive;
+      if (dashboardResult && !dashboardResult.fetchError) {
+        const incomingIncidents = dashboardResult.incidents || [];
+        const incidentMap = new Map(
+          incomingIncidents.map((item) => [
+            String(item.id),
+            item.recovery_status
+          ])
+        );
 
-      setData({
-        employees: dashboardResult.employees || [],
-        incidents: incomingIncidents,
-        payments: dashboardResult.payments || [],
-        total_salary: dashboardResult.total_salary || 0
-      });
+        if (previousIncidentStates.current !== null) {
+          const previous = previousIncidentStates.current;
+          const newest = [...incomingIncidents].sort(
+            (a, b) => Number(b.id) - Number(a.id)
+          )[0];
 
-      setApiStatus(statusResult || {
-        active: false,
-        status: 'unknown'
-      });
-
-      setCacheInfo(
-        dashboardResult._cache || {
-          cached: dashboardResult.data_source === 'cache',
-          stale: dashboardResult.data_source === 'cache'
+          if (newest && !previous.has(String(newest.id))) {
+            setIncidentNotice(
+              `Failure detected: ${newest.failure_type}. Automatic recovery has started.`
+            );
+            setNotice('');
+          } else if (
+            newest &&
+            previous.has(String(newest.id)) &&
+            previous.get(String(newest.id)) !== newest.recovery_status
+          ) {
+            if (newest.recovery_status === 'Recovered') {
+              setNotice(
+                `Recovery completed: ${newest.failure_type}. The backend recorded a verified recovery.`
+              );
+              setIncidentNotice('');
+              setError('');
+            } else if (
+              ['Unrecovered', 'Failed'].includes(newest.recovery_status)
+            ) {
+              setIncidentNotice(
+                `Recovery needs attention: ${newest.failure_type}. Check the incident timeline.`
+              );
+            }
+          }
         }
-      );
 
-      setQueueItems(queueResult.items || []);
-      setQueueInfo({
-        ...emptyQueueSummary,
-        ...(queueResult.summary || {})
-      });
+        previousIncidentStates.current = incidentMap;
 
-      setApiUnavailable(apiIsActive);
-      setError('');
+        // Use the backend's current/cached snapshot. Never add queued employee
+        // records locally; only a later backend response can show a saved row.
+        setData({
+          employees: dashboardResult.employees || [],
+          incidents: incomingIncidents,
+          payments: dashboardResult.payments || [],
+          total_salary: dashboardResult.total_salary || 0
+        });
+
+        setCacheInfo(
+          dashboardResult._cache || {
+            cached: dashboardResult.data_source === 'cache',
+            stale: dashboardResult.data_source === 'cache'
+          }
+        );
+
+        setError('');
+      } else if (dashboardResult?.fetchError) {
+        setError(
+          'Dashboard data is temporarily unavailable. Status monitoring is still active; check the fault status below.'
+        );
+      }
     } catch (e) {
-      setError(
-        e.message || 'Unable to connect to the ResilPay backend.'
-      );
-      setApiUnavailable(true);
+      setError(e.message || 'Unable to refresh ResilPay status.');
+      setBackendDisconnected(true);
     } finally {
       setLoading(false);
       refreshInProgress.current = false;
@@ -247,13 +296,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    mounted.current = true;
     refresh();
 
-    const pollId = window.setInterval(() => {
-      refresh();
-    }, 2000);
-
+    const pollId = window.setInterval(refresh, POLL_INTERVAL);
     const onVisible = () => {
       if (document.visibilityState === 'visible') refresh();
     };
@@ -262,7 +307,6 @@ export default function App() {
     document.addEventListener('visibilitychange', onVisible);
 
     return () => {
-      mounted.current = false;
       window.clearInterval(pollId);
       window.removeEventListener('focus', onVisible);
       document.removeEventListener('visibilitychange', onVisible);
@@ -272,37 +316,46 @@ export default function App() {
   const employees = data.employees;
 
   const selected =
-    employees.find(e => Number(e.id) === Number(selectedId)) ||
+    employees.find((employee) => Number(employee.id) === Number(selectedId)) ||
     employees[0];
 
-  const filtered = employees.filter(e =>
-    `${e.name} ${e.department} ${e.id}`
+  const filtered = employees.filter((employee) =>
+    `${employee.name} ${employee.department} ${employee.id}`
       .toLowerCase()
       .includes(search.toLowerCase())
   );
 
-  // Use the latest transaction per employee for the current payroll period.
-  const currentPeriodPayments = data.payments.filter(p =>
-    !p.payroll_period || p.payroll_period === period()
+  const currentPeriodPayments = data.payments.filter(
+    (payment) =>
+      !payment.payroll_period || payment.payroll_period === period()
   );
 
-  const latestByEmployee = new Map();
+  const latestByEmployee = useMemo(() => {
+    const result = new Map();
 
-  [...currentPeriodPayments]
-    .sort((a, b) => Number(b.id || 0) - Number(a.id || 0))
-    .forEach(payment => {
-      if (!latestByEmployee.has(Number(payment.employee_id))) {
-        latestByEmployee.set(Number(payment.employee_id), payment);
-      }
-    });
+    [...currentPeriodPayments]
+      .sort((a, b) => Number(b.id || 0) - Number(a.id || 0))
+      .forEach((payment) => {
+        if (!result.has(Number(payment.employee_id))) {
+          result.set(Number(payment.employee_id), payment);
+        }
+      });
 
-  const paid = currentPeriodPayments.filter(p => p.status === 'PAID');
+    return result;
+  }, [data.payments, currentPeriodPayments.length]);
+
+  const paid = currentPeriodPayments.filter(
+    (payment) => payment.status === 'PAID'
+  );
+
+  const pendingQueueItems = queueItems.filter((item) =>
+    ['Queued', 'Processing', 'NeedsReconciliation'].includes(item.status)
+  );
 
   useEffect(() => {
     if (!selected) return;
 
     setSelectedId(selected.id);
-
     setSalaryForm({
       hra: selected.hra || 0,
       bonus: selected.bonus || 0,
@@ -318,6 +371,7 @@ export default function App() {
   ]);
 
   function startAddEmployee() {
+    if (networkBlocked) return;
     setEditingEmployee(null);
     setForm(emptyEmployeeForm);
     setShowForm(true);
@@ -326,6 +380,7 @@ export default function App() {
   }
 
   function startEditEmployee(employee) {
+    if (networkBlocked) return;
     setEditingEmployee(employee);
     setForm({
       name: employee.name || '',
@@ -343,8 +398,10 @@ export default function App() {
     setForm(emptyEmployeeForm);
   }
 
-  async function addEmployee(e) {
-    e.preventDefault();
+  async function addEmployee(event) {
+    event.preventDefault();
+    if (networkBlocked || saving) return;
+
     setSaving(true);
     setError('');
     setNotice('');
@@ -358,9 +415,9 @@ export default function App() {
 
       if (result.queued) {
         setNotice(
-          `Employee addition queued (ID ${result.queue_id}). ` +
-          'The employee is not saved to SQLite until queue processing succeeds.'
+          `Employee addition queued (${result.queue_id}). It is not saved to SQLite until recovery succeeds.`
         );
+        closeEmployeeForm();
       } else {
         setNotice(result.message || 'Employee added successfully.');
         closeEmployeeForm();
@@ -369,17 +426,17 @@ export default function App() {
       await refresh();
     } catch (e) {
       setError(
-        `Employee save was not confirmed: ${e.message}. ` +
-        'Check the queue and employee list before retrying.'
+        `Employee addition was not confirmed: ${e.message}. Check the queue and employee list before retrying.`
       );
+      await refresh();
     } finally {
       setSaving(false);
     }
   }
 
-  async function updateEmployee(e) {
-    e.preventDefault();
-    if (!editingEmployee) return;
+  async function updateEmployee(event) {
+    event.preventDefault();
+    if (!editingEmployee || networkBlocked || saving) return;
 
     setSaving(true);
     setError('');
@@ -398,9 +455,9 @@ export default function App() {
 
       if (result.queued) {
         setNotice(
-          `Employee update queued (ID ${result.queue_id}). ` +
-          'The saved employee record has not changed yet.'
+          `Employee update queued (${result.queue_id}). The saved record remains unchanged until replay completes.`
         );
+        closeEmployeeForm();
       } else {
         setNotice(result.message || 'Employee updated successfully.');
         closeEmployeeForm();
@@ -409,18 +466,19 @@ export default function App() {
       await refresh();
     } catch (e) {
       setError(
-        `Employee update was not confirmed: ${e.message}. ` +
-        'Review the current employee record before retrying.'
+        `Employee update was not confirmed: ${e.message}. Review the employee record before retrying.`
       );
+      await refresh();
     } finally {
       setSaving(false);
     }
   }
 
   async function deleteEmployee(employee) {
+    if (networkBlocked || deletingId !== null) return;
+
     const confirmed = window.confirm(
-      `Delete employee ${employee.name} (EMP${String(employee.id).padStart(3, '0')})?\n\n` +
-      'The backend may reject deletion if payment history exists.'
+      `Delete employee ${employee.name} (EMP${String(employee.id).padStart(3, '0')})?\n\nThe backend may reject deletion if payment history exists.`
     );
 
     if (!confirmed) return;
@@ -435,26 +493,32 @@ export default function App() {
         'DELETE'
       );
 
-      setNotice(result.message || 'Employee deleted successfully.');
+      if (result.queued) {
+        setNotice(
+          `Employee deletion queued (${result.queue_id}). The employee remains visible until the queue reports Completed.`
+        );
+      } else {
+        setNotice(result.message || 'Employee deleted successfully.');
 
-      if (Number(selectedId) === Number(employee.id)) {
-        setSelectedId(null);
+        if (Number(selectedId) === Number(employee.id)) {
+          setSelectedId(null);
+        }
       }
 
       await refresh();
     } catch (e) {
       setError(
-        `Employee was not deleted: ${e.message}. ` +
-        'The backend may preserve employees with payment history.'
+        `Employee deletion was not confirmed: ${e.message}. Check the queue and employee list.`
       );
+      await refresh();
     } finally {
       setDeletingId(null);
     }
   }
 
-  async function saveSalary(e) {
-    e.preventDefault();
-    if (!selected) return;
+  async function saveSalary(event) {
+    event.preventDefault();
+    if (!selected || networkBlocked || saving) return;
 
     setSaving(true);
     setError('');
@@ -474,25 +538,26 @@ export default function App() {
 
       if (result.queued) {
         setNotice(
-          `Salary update queued (ID ${result.queue_id}). ` +
-          'It is not saved until the queue reports Completed.'
+          `Salary update queued (${result.queue_id}). It is not saved until the queue reports Completed.`
         );
       } else {
-        setNotice(result.message || 'Salary structure update accepted.');
+        setNotice(result.message || 'Salary structure updated.');
       }
 
       await refresh();
     } catch (e) {
       setError(
-        `Salary update was not confirmed: ${e.message}. ` +
-        'Check the employee record and queue before retrying.'
+        `Salary update was not confirmed: ${e.message}. Check the queue and employee record before retrying.`
       );
+      await refresh();
     } finally {
       setSaving(false);
     }
   }
 
   async function payEmployee(employee) {
+    if (networkBlocked || busyId !== null) return;
+
     setBusyId(employee.id);
     setError('');
     setNotice('');
@@ -504,18 +569,22 @@ export default function App() {
         { run_id: period() }
       );
 
-      setNotice(
-        result.message ||
-        `Payment status: ${result.status || 'check transaction history'}.`
-      );
+      if (result.queued) {
+        setNotice(
+          `Payment request queued (${result.queue_id}). No payment is confirmed yet. Check the final queue result after recovery.`
+        );
+      } else {
+        setNotice(
+          result.message ||
+          `Payment status: ${result.payment?.status || 'review transaction history'}.`
+        );
+      }
 
       await refresh();
     } catch (e) {
       setError(
-        `Payment was not confirmed: ${e.message}. ` +
-        'Review the transaction history before retrying; do not assume it failed.'
+        `Payment was not confirmed: ${e.message}. Review transaction history before retrying; do not assume the payment failed.`
       );
-
       await refresh();
     } finally {
       setBusyId(null);
@@ -523,10 +592,10 @@ export default function App() {
   }
 
   async function runPayroll() {
+    if (networkBlocked || saving) return;
+
     const confirmed = window.confirm(
-      `Run simulated payroll for ${period()}?\n\n` +
-      'Already-paid employees should be skipped by the backend. ' +
-      'Review transaction history if a previous run had an uncertain outcome.'
+      `Run simulated payroll for ${period()}?\n\nReview existing transaction history if a previous run had an uncertain outcome.`
     );
 
     if (!confirmed) return;
@@ -536,26 +605,25 @@ export default function App() {
     setNotice('');
 
     try {
-      const result = await writeJson(
-        `${API}/payments/run`,
-        'POST',
-        { run_id: period() }
-      );
+      const result = await writeJson(`${API}/payments/run`, 'POST', {
+        run_id: period()
+      });
 
-      setNotice(
-        `Payroll run ${result.run_id || period()}: ` +
-        `${result.paid_count ?? 0} paid, ` +
-        `${result.failed_count ?? 0} failed. ` +
-        'No real money was transferred.'
-      );
+      if (result.queued) {
+        setNotice(
+          `Payroll run queued (${result.queue_id}). No payment is confirmed until processing finishes.`
+        );
+      } else {
+        setNotice(
+          `Payroll run ${result.run_id || period()}: ${result.paid_count ?? 0} paid, ${result.failed_count ?? 0} failed. No real money was transferred.`
+        );
+      }
 
       await refresh();
     } catch (e) {
       setError(
-        `Payroll run was not fully confirmed: ${e.message}. ` +
-        'Review payment records before running it again.'
+        `Payroll run was not fully confirmed: ${e.message}. Review payment records before running it again.`
       );
-
       await refresh();
     } finally {
       setSaving(false);
@@ -599,16 +667,12 @@ export default function App() {
     return latestByEmployee.get(Number(employee.id))?.status || 'UNPAID';
   }
 
-  const pendingQueueItems = queueItems.filter(item =>
-    ['Queued', 'Processing'].includes(item.status)
-  );
-
   return (
     <div className="rp-app">
       <header className="rp-topbar">
         <button
           className="rp-menu"
-          onClick={() => setSidebarOpen(v => !v)}
+          onClick={() => setSidebarOpen((value) => !value)}
           title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
           aria-label="Toggle sidebar"
         >
@@ -636,9 +700,7 @@ export default function App() {
 
       <div className={`rp-layout ${sidebarOpen ? '' : 'is-collapsed'}`}>
         <aside className="rp-sidebar">
-          {sidebarOpen && (
-            <div className="rp-side-heading">WORKSPACE</div>
-          )}
+          {sidebarOpen && <div className="rp-side-heading">WORKSPACE</div>}
 
           {navItem('overview', 'Overview', LayoutDashboard)}
           {navItem('employees', 'Employees', Users)}
@@ -658,6 +720,7 @@ export default function App() {
             className="sidebar-link"
             onClick={refresh}
             title="Refresh data"
+            disabled={backendDisconnected}
           >
             <History size={18} />
             {sidebarOpen && <span>Refresh data</span>}
@@ -704,7 +767,7 @@ export default function App() {
               <button
                 className="rp-btn secondary"
                 onClick={refresh}
-                disabled={loading}
+                disabled={loading || backendDisconnected}
               >
                 <RefreshCw size={15} /> Refresh
               </button>
@@ -712,13 +775,19 @@ export default function App() {
               <button
                 className="rp-btn primary"
                 onClick={startAddEmployee}
+                disabled={networkBlocked}
+                title={
+                  networkBlocked
+                    ? 'Disabled until network recovery is verified'
+                    : 'Add employee'
+                }
               >
                 <Plus size={16} /> Add employee
               </button>
             </div>
           </div>
 
-          {apiUnavailable && (
+          {networkBlocked && (
             <div
               role="alert"
               aria-live="assertive"
@@ -726,54 +795,73 @@ export default function App() {
               style={{
                 display: 'flex',
                 alignItems: 'flex-start',
-                gap: '12px',
+                gap: 12,
                 padding: '16px 18px',
-                marginBottom: '16px',
+                marginBottom: 16,
                 border: '1px solid #D88A83',
-                borderRadius: '12px',
+                borderRadius: 12,
                 background: '#FBE9E7',
                 color: '#842D2D'
               }}
             >
-              <AlertCircle
-                size={22}
-                style={{ flexShrink: 0, marginTop: '2px' }}
-              />
-
+              <AlertCircle size={22} style={{ flexShrink: 0, marginTop: 2 }} />
               <div style={{ flex: 1 }}>
-                <strong style={{ display: 'block', marginBottom: '4px' }}>
-                  Backend operation temporarily unavailable
+                <strong style={{ display: 'block', marginBottom: 4 }}>
+                  {backendDisconnected
+                    ? 'Backend connection unavailable'
+                    : 'Network failure — payroll actions disabled'}
                 </strong>
-
                 <span>
-                  The backend reports an active API failure or the connection
-                  could not be checked. Do not assume a write operation has
-                  succeeded unless the backend confirms it. Monitoring may
-                  remain available while payroll actions are blocked.
+                  {backendDisconnected
+                    ? 'ResilPay cannot verify backend status. Write actions are disabled to prevent unconfirmed changes.'
+                    : 'Writes are disabled until network recovery clears the fault and verifies service health. Existing employee and payment records remain unchanged.'}
                 </span>
-
                 {error && (
-                  <small style={{ display: 'block', marginTop: '6px' }}>
+                  <small style={{ display: 'block', marginTop: 6 }}>
                     Details: {error}
                   </small>
                 )}
               </div>
-
               <button
                 type="button"
                 onClick={refresh}
+                disabled={backendDisconnected}
                 style={{
                   border: '1px solid #B85B55',
-                  borderRadius: '8px',
+                  borderRadius: 8,
                   padding: '7px 10px',
                   background: '#FFF8F7',
                   color: '#842D2D',
-                  cursor: 'pointer',
+                  cursor: backendDisconnected ? 'not-allowed' : 'pointer',
                   whiteSpace: 'nowrap'
                 }}
               >
-                Retry now
+                Retry status
               </button>
+            </div>
+          )}
+
+          {databaseFault && (
+            <div className="rp-alert error" role="alert" aria-live="assertive">
+              <AlertCircle size={18} />
+              <span>
+                <strong>Database failure — operations are waiting.</strong>{' '}
+                Eligible employee changes and payment requests can be queued by
+                Flask. They are not saved or confirmed until database recovery
+                is verified and the queue reports a final result.
+              </span>
+            </div>
+          )}
+
+          {apiFault && !networkBlocked && (
+            <div className="rp-alert error" role="alert" aria-live="assertive">
+              <AlertCircle size={18} />
+              <span>
+                <strong>API failure active.</strong>{' '}
+                Monitoring remains available. Eligible operations may be queued
+                by the backend; check each queue item's final status before
+                assuming a change was saved.
+              </span>
             </div>
           )}
 
@@ -785,7 +873,7 @@ export default function App() {
             </div>
           )}
 
-          {error && !apiUnavailable && (
+          {error && !networkBlocked && (
             <div className="rp-alert error" role="alert" aria-live="assertive">
               <AlertCircle size={17} />
               <span>{error}</span>
@@ -803,7 +891,8 @@ export default function App() {
 
           {(cacheInfo.cached ||
             queueInfo.pending > 0 ||
-            queueInfo.failed > 0) && (
+            queueInfo.failed > 0 ||
+            queueInfo.needs_reconciliation > 0) && (
             <div
               className="rp-alert"
               role="status"
@@ -820,7 +909,7 @@ export default function App() {
                   <strong>
                     {cacheInfo.stale ? 'Cached · may be stale' : 'Cached data'}
                   </strong>
-                  {' '}— showing last-known-good read data; writes still require
+                  {' '}— showing last-known-good data; writes still require
                   backend confirmation.
                 </span>
               )}
@@ -828,20 +917,29 @@ export default function App() {
               {queueInfo.pending > 0 && (
                 <span>
                   <strong>{queueInfo.pending} operation(s) queued</strong>
-                  {' '}— pending operations are not yet saved.
+                  {' '}— these operations are not yet confirmed as saved.
                 </span>
               )}
 
               {queueInfo.failed > 0 && (
                 <span>
                   <strong>{queueInfo.failed} queued operation(s) failed</strong>
-                  {' '}— review before retrying.
+                  {' '}— review their results before retrying.
+                </span>
+              )}
+
+              {queueInfo.needs_reconciliation > 0 && (
+                <span>
+                  <strong>
+                    {queueInfo.needs_reconciliation} operation(s) need
+                    reconciliation
+                  </strong>
+                  {' '}— verify the actual outcome before retrying.
                 </span>
               )}
             </div>
           )}
 
-          {/* Employee add/edit form */}
           {showForm && (
             <form
               className="rp-panel rp-form"
@@ -851,9 +949,11 @@ export default function App() {
                 <div>
                   <h2>{editingEmployee ? 'Edit employee' : 'New employee'}</h2>
                   <p>
-                    {editingEmployee
-                      ? 'Update the employee record.'
-                      : 'Add a record to the employee register.'}
+                    {databaseFault
+                      ? 'The backend may queue this change until database recovery.'
+                      : editingEmployee
+                        ? 'Update the employee record.'
+                        : 'Add a record to the employee register.'}
                   </p>
                 </div>
 
@@ -874,8 +974,8 @@ export default function App() {
                     required
                     maxLength={120}
                     value={form.name}
-                    onChange={e =>
-                      setForm({ ...form, name: e.target.value })
+                    onChange={(event) =>
+                      setForm({ ...form, name: event.target.value })
                     }
                   />
                 </label>
@@ -886,8 +986,8 @@ export default function App() {
                     required
                     maxLength={120}
                     value={form.department}
-                    onChange={e =>
-                      setForm({ ...form, department: e.target.value })
+                    onChange={(event) =>
+                      setForm({ ...form, department: event.target.value })
                     }
                   />
                 </label>
@@ -900,54 +1000,55 @@ export default function App() {
                     min="0.01"
                     step="0.01"
                     value={form.salary}
-                    onChange={e =>
-                      setForm({ ...form, salary: e.target.value })
+                    onChange={(event) =>
+                      setForm({ ...form, salary: event.target.value })
                     }
                   />
                 </label>
               </div>
 
-              <button className="rp-btn primary" disabled={saving}>
+              <button
+                className="rp-btn primary"
+                disabled={saving || networkBlocked}
+              >
                 {saving
-                  ? 'Saving…'
+                  ? 'Submitting…'
                   : editingEmployee
                     ? 'Save employee changes'
                     : 'Save employee'}
               </button>
+
+              {databaseFault && (
+                <p className="rp-footnote">
+                  The employee will not appear in the employee list until the
+                  backend confirms that the queued operation completed.
+                </p>
+              )}
             </form>
           )}
 
-          {/* Recovery queue: individual items and statuses */}
           <section className="rp-panel" style={{ marginBottom: 16 }}>
             <div className="rp-panel-title">
               <div>
-                <h2><ListChecks size={18} style={{ verticalAlign: 'middle' }} /> Recovery queue</h2>
+                <h2>
+                  <ListChecks size={18} style={{ verticalAlign: 'middle' }} />{' '}
+                  Recovery queue
+                </h2>
                 <p>
                   Queued changes are not saved until their status is Completed.
                 </p>
               </div>
-
-              <span className="rp-count">
-                {queueInfo.pending} PENDING
-              </span>
+              <span className="rp-count">{queueInfo.pending} PENDING</span>
             </div>
 
             <div className="rp-overview-grid">
+              <div><span>Queued</span><strong>{queueInfo.queued}</strong></div>
+              <div><span>Processing</span><strong>{queueInfo.processing}</strong></div>
+              <div><span>Completed</span><strong>{queueInfo.completed}</strong></div>
+              <div><span>Failed</span><strong>{queueInfo.failed}</strong></div>
               <div>
-                <span>Queued</span>
-                <strong>{queueInfo.queued}</strong>
-              </div>
-              <div>
-                <span>Processing</span>
-                <strong>{queueInfo.processing}</strong>
-              </div>
-              <div>
-                <span>Completed</span>
-                <strong>{queueInfo.completed}</strong>
-              </div>
-              <div>
-                <span>Failed</span>
-                <strong>{queueInfo.failed}</strong>
+                <span>Needs review</span>
+                <strong>{queueInfo.needs_reconciliation}</strong>
               </div>
             </div>
 
@@ -961,9 +1062,8 @@ export default function App() {
                     <th>RESULT</th>
                   </tr>
                 </thead>
-
                 <tbody>
-                  {queueItems.map(item => (
+                  {queueItems.map((item) => (
                     <tr key={item.queue_id}>
                       <td>
                         <b>{item.method}</b> {item.path}
@@ -971,7 +1071,6 @@ export default function App() {
                           ID: {item.queue_id}
                         </small>
                       </td>
-
                       <td>
                         <span
                           className={`rp-status ${String(item.status || '').toLowerCase()}`}
@@ -979,13 +1078,11 @@ export default function App() {
                           {item.status}
                         </span>
                       </td>
-
                       <td>
                         {item.created_at
                           ? new Date(item.created_at).toLocaleString()
                           : '—'}
                       </td>
-
                       <td>
                         {item.result?.message || 'Waiting for processing'}
                       </td>
@@ -1005,8 +1102,8 @@ export default function App() {
 
             {pendingQueueItems.length > 0 && (
               <p className="rp-footnote">
-                Pending changes are not yet saved in the employee database.
-                Refresh this panel to follow their status.
+                Pending changes are not yet confirmed in the database. Keep
+                this page open to follow their status.
               </p>
             )}
           </section>
@@ -1045,15 +1142,12 @@ export default function App() {
                 <div className="rp-panel-title">
                   <div>
                     <h2>Payroll snapshot</h2>
-                    <p>
-                      Summary of employee compensation and payment status.
-                    </p>
+                    <p>Summary of employee compensation and payment status.</p>
                   </div>
-
                   <button
                     className="rp-btn primary"
                     onClick={runPayroll}
-                    disabled={saving || apiUnavailable}
+                    disabled={saving || networkBlocked}
                   >
                     <Wallet size={16} />
                     {saving ? 'Processing…' : 'Run simulated payroll'}
@@ -1064,7 +1158,9 @@ export default function App() {
                   <div>
                     <span>Employees awaiting payment</span>
                     <strong>
-                      {employees.filter(e => paymentStatus(e) !== 'PAID').length}
+                      {employees.filter((employee) =>
+                        paymentStatus(employee) !== 'PAID'
+                      ).length}
                     </strong>
                   </div>
                   <div>
@@ -1094,13 +1190,14 @@ export default function App() {
 
                 <EmployeeTable
                   employees={employees.slice(0, 5)}
-                  onSalary={employee => {
+                  onSalary={(employee) => {
                     setSelectedId(employee.id);
                     setTab('salary');
                   }}
                   onEdit={startEditEmployee}
                   onDelete={deleteEmployee}
                   deletingId={deletingId}
+                  networkBlocked={networkBlocked}
                 />
               </section>
             </>
@@ -1120,20 +1217,21 @@ export default function App() {
                 <Search size={16} />
                 <input
                   value={search}
-                  onChange={e => setSearch(e.target.value)}
+                  onChange={(event) => setSearch(event.target.value)}
                   placeholder="Search name, department or employee ID"
                 />
               </div>
 
               <EmployeeTable
                 employees={filtered}
-                onSalary={employee => {
+                onSalary={(employee) => {
                   setSelectedId(employee.id);
                   setTab('salary');
                 }}
                 onEdit={startEditEmployee}
                 onDelete={deleteEmployee}
                 deletingId={deletingId}
+                networkBlocked={networkBlocked}
               />
             </section>
           )}
@@ -1155,9 +1253,11 @@ export default function App() {
                     EMPLOYEE
                     <select
                       value={selected.id}
-                      onChange={e => setSelectedId(Number(e.target.value))}
+                      onChange={(event) =>
+                        setSelectedId(Number(event.target.value))
+                      }
                     >
-                      {employees.map(employee => (
+                      {employees.map((employee) => (
                         <option key={employee.id} value={employee.id}>
                           {employee.name} — {employee.department}
                         </option>
@@ -1193,10 +1293,10 @@ export default function App() {
                               min="0"
                               step="0.01"
                               value={salaryForm[field]}
-                              onChange={e =>
+                              onChange={(event) =>
                                 setSalaryForm({
                                   ...salaryForm,
-                                  [field]: e.target.value
+                                  [field]: event.target.value
                                 })
                               }
                             />
@@ -1222,10 +1322,17 @@ export default function App() {
 
                     <button
                       className="rp-btn primary"
-                      disabled={saving || apiUnavailable}
+                      disabled={saving || networkBlocked}
                     >
-                      {saving ? 'Saving…' : 'Save salary structure'}
+                      {saving ? 'Submitting…' : 'Save salary structure'}
                     </button>
+
+                    {databaseFault && (
+                      <p className="rp-footnote">
+                        The salary update may be queued. The saved values remain
+                        unchanged until the queue reports Completed.
+                      </p>
+                    )}
                   </form>
                 </>
               )}
@@ -1239,11 +1346,10 @@ export default function App() {
                   <h2>Payment register</h2>
                   <p>Payment status for the current demo payroll period.</p>
                 </div>
-
                 <button
                   className="rp-btn primary"
                   onClick={runPayroll}
-                  disabled={saving || apiUnavailable}
+                  disabled={saving || networkBlocked}
                 >
                   <Wallet size={15} /> Run all
                 </button>
@@ -1259,7 +1365,9 @@ export default function App() {
                   <span>
                     Unpaid / pending{' '}
                     <b>
-                      {employees.filter(e => paymentStatus(e) !== 'PAID').length}
+                      {employees.filter((employee) =>
+                        paymentStatus(employee) !== 'PAID'
+                      ).length}
                     </b>
                   </span>
                 </div>
@@ -1280,12 +1388,9 @@ export default function App() {
                       <th>ACTION</th>
                     </tr>
                   </thead>
-
                   <tbody>
-                    {employees.map(employee => {
-                      const payment = latestByEmployee.get(
-                        Number(employee.id)
-                      );
+                    {employees.map((employee) => {
+                      const payment = latestByEmployee.get(Number(employee.id));
                       const status = payment?.status || 'UNPAID';
 
                       return (
@@ -1295,12 +1400,11 @@ export default function App() {
                               <span className="rp-avatar">
                                 {employee.name
                                   .split(/\s+/)
-                                  .map(x => x[0])
+                                  .map((part) => part[0])
                                   .slice(0, 2)
                                   .join('')
                                   .toUpperCase()}
                               </span>
-
                               <div>
                                 <b>{employee.name}</b>
                                 <small>
@@ -1328,7 +1432,7 @@ export default function App() {
                               disabled={
                                 busyId === employee.id ||
                                 status === 'PAID' ||
-                                apiUnavailable
+                                networkBlocked
                               }
                               onClick={() => payEmployee(employee)}
                             >
@@ -1336,7 +1440,9 @@ export default function App() {
                                 ? 'Processing…'
                                 : status === 'PAID'
                                   ? 'Paid'
-                                  : 'Pay (demo)'}
+                                  : status === 'FAILED'
+                                    ? 'Review payment'
+                                    : 'Pay (demo)'}
                             </button>
                           </td>
                         </tr>
@@ -1355,8 +1461,9 @@ export default function App() {
               </div>
 
               <p className="rp-footnote">
-                Simulated transactions only. Check transaction history before
-                retrying any payment with an uncertain outcome.
+                Simulated transactions only. An uncertain or failed payment
+                must be reconciled before retrying. Provider recovery alone does
+                not confirm payment success.
               </p>
             </section>
           )}
@@ -1375,7 +1482,8 @@ function EmployeeTable({
   onSalary,
   onEdit,
   onDelete,
-  deletingId
+  deletingId,
+  networkBlocked
 }) {
   return (
     <div className="rp-table-wrap">
@@ -1390,21 +1498,19 @@ function EmployeeTable({
             <th>ACTIONS</th>
           </tr>
         </thead>
-
         <tbody>
-          {employees.map(employee => (
+          {employees.map((employee) => (
             <tr key={employee.id}>
               <td>
                 <div className="rp-employee-cell">
                   <span className="rp-avatar">
                     {employee.name
                       .split(/\s+/)
-                      .map(x => x[0])
+                      .map((part) => part[0])
                       .slice(0, 2)
                       .join('')
                       .toUpperCase()}
                   </span>
-
                   <div>
                     <b>{employee.name}</b>
                     <small>{employee.designation || 'Employee'}</small>
@@ -1431,6 +1537,7 @@ function EmployeeTable({
                     type="button"
                     className="rp-btn small"
                     onClick={() => onEdit(employee)}
+                    disabled={networkBlocked}
                     title="Edit employee"
                   >
                     <Pencil size={14} /> Edit
@@ -1439,7 +1546,7 @@ function EmployeeTable({
                   <button
                     type="button"
                     className="rp-btn small"
-                    disabled={deletingId === employee.id}
+                    disabled={deletingId === employee.id || networkBlocked}
                     onClick={() => onDelete(employee)}
                     title="Delete employee"
                   >
