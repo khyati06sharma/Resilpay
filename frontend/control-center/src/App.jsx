@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 const API = "/api";
+const localPayrollPeriod = () => { const date = new Date(); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`; };
 
 const initialServices = [
   { id: "api", name: "Application API", detail: "Dashboard & employee requests" },
@@ -49,9 +50,9 @@ function formatDate(value) {
 
 function statusOf(value) {
   const text = String(value || "").toLowerCase();
-  if (["healthy", "ok", "online", "recovered", "resolved", "paid", "success"].some((x) => text.includes(x))) return "healthy";
-  if (["failed", "down", "unavailable", "critical", "error"].some((x) => text.includes(x))) return "failed";
-  if (["degraded", "recovering", "pending", "detected", "diagnosed", "action"].some((x) => text.includes(x))) return "warning";
+  if (["healthy", "ok", "online", "recovered", "resolved", "paid", "success", "completed", "stable"].some((x) => text.includes(x))) return "healthy";
+  if (["failed", "down", "unavailable", "critical", "error", "unrecovered"].some((x) => text.includes(x))) return "failed";
+  if (["degraded", "recovering", "pending", "processing", "detected", "diagnosed", "action", "deploying", "rolling", "verifying"].some((x) => text.includes(x))) return "warning";
   return "neutral";
 }
 
@@ -89,6 +90,9 @@ function App() {
   const [actionMessage, setActionMessage] = useState("");
   const [busy, setBusy] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [processorStatus, setProcessorStatus] = useState({});
+  const [processorIncidents, setProcessorIncidents] = useState([]);
+  const [processorBusy, setProcessorBusy] = useState("");
 
   const loadData = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -103,6 +107,8 @@ function App() {
         request("/api-status"),
         request("/recovery-queue"),
         request("/cache-status"),
+        request("/processor-status"),
+        request("/processor-incidents"),
       ]);
 
       if (results[0].status === "fulfilled") {
@@ -122,6 +128,8 @@ function App() {
       if (results[4].status === "fulfilled") setApiStatus(results[4].value || {});
       if (results[5].status === "fulfilled") setQueueState(results[5].value || { summary: {}, items: [] });
       if (results[6].status === "fulfilled") setCacheState(results[6].value || {});
+      if (results[7].status === "fulfilled") setProcessorStatus(results[7].value || {});
+      if (results[8].status === "fulfilled") setProcessorIncidents(results[8].value?.incidents || []);
       request("/recovery-status").then((value) => setRecoveryState(value || { recoveries: {}, stages: [] })).catch(() => {});
 
       setLastUpdated(new Date());
@@ -216,6 +224,22 @@ function App() {
     }
   }
 
+  async function runProcessorAction(action) {
+    setProcessorBusy(action);
+    setActionMessage("");
+    try {
+      const path = action === "deploy" ? "/chaos/deploy-faulty" : "/payroll/process";
+      const result = await request(path, { method: "POST", body: action === "process" ? JSON.stringify({ payroll_period: localPayrollPeriod() }) : undefined });
+      setActionMessage(result.message || (action === "deploy" ? "Faulty processor deployment started." : "Payroll processing started."));
+      await loadData(true);
+    } catch (err) {
+      setActionMessage(err.message || "Processor action failed.");
+      await loadData(true);
+    } finally {
+      setProcessorBusy("");
+    }
+  }
+
   async function refreshNow() {
     await loadData(true);
   }
@@ -274,7 +298,7 @@ function App() {
             {!collapsed && (
               <div>
                 <strong>Monitoring active</strong>
-                <small>Auto-refresh every 5 sec</small>
+                <small>Auto-refresh every 1.5 sec</small>
               </div>
             )}
           </div>
@@ -361,6 +385,52 @@ function App() {
                 <Metric label="Employees" value={employees.length} note="Currently registered" icon="♙" />
               </div>
 
+              <section className="panel processor-panel" style={{marginTop:16, marginBottom:16}}>
+                <div className="panel-heading">
+                  <div><h2>Payment processor rollback</h2><p>Real processor health checks, automatic rollback, and persisted job outcomes.</p></div>
+                  <Badge status={processorStatus.health?.healthy ? "healthy" : processorStatus.deployment_status === "stable" ? "failed" : "warning"}>
+                    {processorStatus.health?.healthy ? "Healthy" : processorStatus.deployment_status || "Checking"}
+                  </Badge>
+                </div>
+                <div className="metrics-grid">
+                  <Metric label="Active processor" value={`v${processorStatus.active_version || "1.0"}`} note={processorStatus.deployment_status || "status unavailable"} icon="⇄" />
+                  <Metric label="Health check" value={processorStatus.health?.healthy == null ? "CHECKING" : processorStatus.health.healthy ? "PASS" : "FAIL"} note={processorStatus.health?.detail || "Waiting for backend"} icon="◎" />
+                  <Metric label="Pending jobs" value={processorStatus.pending_jobs ?? 0} note="Persisted in SQLite" icon="◷" />
+                  <Metric label="Last recovery" value={processorStatus.last_recovery_seconds != null ? `${processorStatus.last_recovery_seconds}s` : "—"} note="Measured by backend controller" icon="↻" />
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10,margin:"14px 0"}}>
+                  <button className="primary-button" disabled={Boolean(processorBusy) || ["deploying","detecting","diagnosing","rolling_back","verifying"].includes(processorStatus.deployment_status)} onClick={() => runProcessorAction("deploy")}>
+                    {processorBusy === "deploy" ? "Deploying…" : "Deploy Faulty Version v2.0"}
+                  </button>
+                  <button className="secondary-button" disabled={Boolean(processorBusy)} onClick={() => runProcessorAction("process")}>
+                    {processorBusy === "process" ? "Processing…" : "Process Payroll"}
+                  </button>
+                </div>
+                <div className="processor-timeline">
+                  <h3 style={{margin:"4px 0 10px"}}>Live recovery timeline</h3>
+                  {(processorStatus.timeline || []).length ? (processorStatus.timeline || []).map((event) => (
+                    <div key={event.id} style={{display:"grid",gridTemplateColumns:"14px minmax(0,1fr) auto",gap:10,alignItems:"start",padding:"9px 0",borderBottom:"1px solid var(--line, #e7dfd8)"}}>
+                      <span style={{width:9,height:9,marginTop:5,borderRadius:99,background:event.status === "success" ? "#47745c" : event.status === "failed" ? "#b34d4d" : "#9b7541"}} />
+                      <div><strong style={{fontSize:13}}>{event.event_type.replaceAll("_"," ")}</strong><div style={{fontSize:12,color:"var(--muted,#82797a)"}}>{event.message}</div></div>
+                      <small style={{fontSize:11,color:"var(--muted,#82797a)"}}>{formatDate(event.created_at)}</small>
+                    </div>
+                  )) : <div className="empty-state">No processor deployment has been recorded yet.</div>}
+                </div>
+                <div className="table-wrap" style={{marginTop:14}}>
+                  <table><thead><tr><th>Incident</th><th>Failed version</th><th>Restored version</th><th>Status</th><th>Recovery time</th></tr></thead>
+                    <tbody>{processorIncidents.slice(0,5).map((incident) => <tr key={incident.id}><td><strong>{incident.failure_type}</strong><small>{incident.diagnosis}</small></td><td>{incident.failed_version}</td><td>{incident.restored_version || "—"}</td><td><Badge status={statusOf(incident.status)}>{incident.status}</Badge></td><td>{incident.recovery_seconds != null ? `${incident.recovery_seconds}s` : "—"}</td></tr>)}
+                    {!processorIncidents.length && <tr><td colSpan="5" className="empty-state">No processor incidents yet.</td></tr>}</tbody>
+                  </table>
+                </div>
+                <div className="table-wrap" style={{marginTop:14}}>
+                  <h3 style={{margin:"4px 0 10px"}}>Payroll jobs</h3>
+                  <table><thead><tr><th>Employee</th><th>Period</th><th>Amount</th><th>Status</th><th>Updated</th></tr></thead>
+                    <tbody>{(processorStatus.jobs || []).slice(0,8).map((job) => <tr key={job.id}><td>Employee #{job.employee_id}</td><td>{job.payroll_period}</td><td>{formatMoney(job.amount)}</td><td><Badge status={statusOf(job.status)}>{job.status}</Badge><small>{job.message}</small></td><td>{formatDate(job.updated_at)}</td></tr>)}
+                    {!(processorStatus.jobs || []).length && <tr><td colSpan="5" className="empty-state">No processor jobs recorded yet.</td></tr>}</tbody>
+                  </table>
+                </div>
+              </section>
+
               <section className="content-grid">
                 <article className="panel service-panel">
                   <div className="panel-heading">
@@ -416,7 +486,7 @@ function App() {
                   {[
                     { id: "database", title: "Database failure", detail: "Simulate database unavailability", icon: "D" },
                     { id: "api", title: "API failure", detail: "Simulate dashboard API disruption", icon: "A" },
-                    { id: "payment", title: "Payment failure", detail: "Simulate a payroll payment issue", icon: "₹" },
+                    { id: "payment", title: "Gateway timeout", detail: "Inject a test gateway timeout into the next payment attempt", icon: "₹" },
                     { id: "network", title: "Network outage", detail: "Trigger a service connectivity outage", icon: "N" },
                   ].map((test) => (
                     <div className="chaos-card" key={test.id}>
@@ -515,7 +585,7 @@ function App() {
                 {[
                   { id: "database", title: "Database failure", detail: "Test database health checks and fallback behavior", icon: "D" },
                   { id: "api", title: "API failure", detail: "Test how the dashboard responds to API disruption", icon: "A" },
-                  { id: "payment", title: "Payment failure", detail: "Test payment failure handling and recovery", icon: "₹" },
+                  { id: "payment", title: "Gateway timeout", detail: "Test a realistic payment confirmation timeout", icon: "₹" },
                   { id: "network", title: "Network outage", detail: "Test network monitoring and service recovery", icon: "N" },
                 ].map((test) => (
                   <div className="chaos-card" key={test.id}>

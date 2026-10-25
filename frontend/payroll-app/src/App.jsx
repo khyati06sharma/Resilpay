@@ -17,7 +17,7 @@ const money = (value) =>
     maximumFractionDigits: 2
   });
 
-const period = () => new Date().toISOString().slice(0, 7);
+const period = () => { const date = new Date(); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`; };
 
 const emptyQueueSummary = {
   pending: 0,
@@ -127,6 +127,7 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
+  const [checkout, setCheckout] = useState({ open: false, mode: 'all', employee: null, method: 'UPI', stage: 'ready', message: '', result: null });
 
   const [form, setForm] = useState(emptyEmployeeForm);
   const [salaryForm, setSalaryForm] = useState({
@@ -325,9 +326,10 @@ export default function App() {
       .includes(search.toLowerCase())
   );
 
+  // Legacy rows without payroll_period are historical/unknown-period records.
+  // Do not count them as confirmed payments for the currently selected period.
   const currentPeriodPayments = data.payments.filter(
-    (payment) =>
-      !payment.payroll_period || payment.payroll_period === period()
+    (payment) => payment.payroll_period === period()
   );
 
   const latestByEmployee = useMemo(() => {
@@ -555,78 +557,105 @@ export default function App() {
     }
   }
 
-  async function payEmployee(employee) {
+  function payEmployee(employee) {
     if (networkBlocked || busyId !== null) return;
-
-    setBusyId(employee.id);
-    setError('');
-    setNotice('');
-
-    try {
-      const result = await writeJson(
-        `${API}/payments/employee/${employee.id}`,
-        'POST',
-        { run_id: period() }
-      );
-
-      if (result.queued) {
-        setNotice(
-          `Payment request queued (${result.queue_id}). No payment is confirmed yet. Check the final queue result after recovery.`
-        );
-      } else {
-        setNotice(
-          result.message ||
-          `Payment status: ${result.payment?.status || 'review transaction history'}.`
-        );
-      }
-
-      await refresh();
-    } catch (e) {
-      setError(
-        `Payment was not confirmed: ${e.message}. Review transaction history before retrying; do not assume the payment failed.`
-      );
-      await refresh();
-    } finally {
-      setBusyId(null);
+    const existingPayment = latestByEmployee.get(Number(employee.id));
+    if (existingPayment?.status === 'PENDING_VERIFICATION') {
+      setCheckout({
+        open: true, mode: 'single', employee, method: existingPayment.payment_method || 'UPI',
+        stage: 'verification',
+        message: 'The gateway has recovered, but this transaction still needs its own status check. Verify it before retrying.',
+        result: { payment: existingPayment }
+      });
+      return;
     }
+    setCheckout({ open: true, mode: 'single', employee, method: 'UPI', stage: 'ready', message: '', result: null });
   }
 
-  async function runPayroll() {
-    if (networkBlocked || saving) return;
-
-    const confirmed = window.confirm(
-      `Run simulated payroll for ${period()}?\n\nReview existing transaction history if a previous run had an uncertain outcome.`
-    );
-
-    if (!confirmed) return;
-
+  async function verifyCheckoutPayment() {
+    const paymentId = checkout.result?.payment?.id;
+    if (!paymentId || saving) return;
     setSaving(true);
     setError('');
     setNotice('');
-
+    setCheckout((current) => ({ ...current, message: 'Checking the saved test transaction…' }));
     try {
-      const result = await writeJson(`${API}/payments/run`, 'POST', {
-        run_id: period()
-      });
-
-      if (result.queued) {
-        setNotice(
-          `Payroll run queued (${result.queue_id}). No payment is confirmed until processing finishes.`
-        );
-      } else {
-        setNotice(
-          `Payroll run ${result.run_id || period()}: ${result.paid_count ?? 0} paid, ${result.failed_count ?? 0} failed. No real money was transferred.`
-        );
-      }
-
+      const result = await writeJson(`${API}/payments/${paymentId}/verify`, 'POST', {});
+      const paid = result.status === 'PAID' || result.payment?.status === 'PAID';
+      setCheckout((current) => ({
+        ...current,
+        stage: paid ? 'complete' : 'ready',
+        message: result.message || (paid
+          ? 'Payment is confirmed. Do not retry.'
+          : 'Verification complete. No simulated charge was recorded; you can safely retry.'),
+        result: { payment: result.payment || current.result?.payment, verification: result }
+      }));
+      setNotice(result.message || 'Payment verification completed.');
       await refresh();
     } catch (e) {
-      setError(
-        `Payroll run was not fully confirmed: ${e.message}. Review payment records before running it again.`
-      );
+      setCheckout((current) => ({
+        ...current,
+        stage: 'verification',
+        message: e.data?.message || e.message || 'Could not verify this transaction yet. Do not retry.'
+      }));
+      setError(e.data?.message || e.message || 'Payment verification is still pending.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function runPayroll() {
+    if (networkBlocked || saving) return;
+    setCheckout({ open: true, mode: 'all', employee: null, method: 'UPI', stage: 'ready', message: '', result: null });
+  }
+
+  const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  async function submitCheckout() {
+    if (checkout.stage === 'processing') return;
+    setCheckout((current) => ({ ...current, stage: 'authorizing', message: 'Creating a local test transaction…', result: null }));
+    setError('');
+    setNotice('');
+    setSaving(true);
+    if (checkout.employee) setBusyId(checkout.employee.id);
+
+    try {
+      await wait(450);
+      setCheckout((current) => ({ ...current, stage: 'processing', message: 'Sending the simulated payment request to ResilPay…' }));
+      await wait(350);
+      const body = { run_id: period(), payment_method: checkout.method };
+      let result;
+      if (checkout.mode === 'single' && checkout.employee) {
+        result = await writeJson(`${API}/payments/employee/${checkout.employee.id}`, 'POST', body);
+      } else {
+        result = await writeJson(`${API}/payments/run`, 'POST', body);
+      }
+      setCheckout((current) => ({ ...current, stage: 'complete', message: result.message || 'Backend returned a result.', result }));
+      setNotice(checkout.mode === 'all'
+        ? `Payroll run ${result.run_id || period()}: ${result.paid_count ?? 0} confirmed, ${result.failed_count ?? 0} not confirmed. No real money moved.`
+        : result.message || `Payment status: ${result.payment?.status || 'review transaction history'}.`);
+      await refresh();
+    } catch (e) {
+      const details = e.data || {};
+      const payment = details.payment;
+      const result = details.payments ? details : payment ? { payment } : details;
+      const uncertain = payment?.status === 'PENDING_VERIFICATION' ||
+        (Array.isArray(details.payments) && details.payments.some((item) => item.status === 'PENDING_VERIFICATION'));
+      setCheckout((current) => ({
+        ...current,
+        stage: uncertain ? 'verification' : 'failed',
+        message: uncertain
+          ? 'Gateway did not confirm this transaction. Its status is pending verification; do not retry blindly.'
+          : (details.message || details.error || e.message || 'The test payment was not confirmed.'),
+        result
+      }));
+      setError(uncertain
+        ? 'Gateway timeout: payment outcome is uncertain. Review the saved transaction before retrying.'
+        : `Payment was not confirmed: ${details.message || e.message}. Review transaction history before retrying.`);
       await refresh();
     } finally {
       setSaving(false);
+      setBusyId(null);
     }
   }
 
@@ -1440,9 +1469,11 @@ export default function App() {
                                 ? 'Processing…'
                                 : status === 'PAID'
                                   ? 'Paid'
-                                  : status === 'FAILED'
-                                    ? 'Review payment'
-                                    : 'Pay (demo)'}
+                                  : status === 'PENDING_VERIFICATION'
+                                    ? 'Verify payment'
+                                    : status === 'FAILED'
+                                      ? 'Retry payment'
+                                      : 'Pay (demo)'}
                             </button>
                           </td>
                         </tr>
@@ -1466,6 +1497,51 @@ export default function App() {
                 not confirm payment success.
               </p>
             </section>
+          )}
+
+          {checkout.open && (
+            <div className="rp-checkout-backdrop" role="presentation">
+              <section className="rp-checkout" role="dialog" aria-modal="true" aria-labelledby="rp-checkout-title">
+                <div className="rp-checkout-header">
+                  <div className="rp-checkout-brand"><span className="rp-checkout-mark">R</span><div><strong>ResilPay Checkout</strong><small>SIMULATED TEST MODE · NO REAL MONEY</small></div></div>
+                  <button className="rp-checkout-close" onClick={() => !saving && setCheckout((current) => ({ ...current, open: false }))} disabled={saving} aria-label="Close checkout">×</button>
+                </div>
+                <div className="rp-checkout-amount">
+                  <span>{checkout.mode === 'single' ? checkout.employee?.name : 'Monthly payroll batch'}</span>
+                  <strong>{money(checkout.mode === 'single' ? salary(checkout.employee || {}).net : employees.reduce((sum, employee) => sum + salary(employee).net, 0))}</strong>
+                  <small>{checkout.mode === 'single' ? `EMP${String(checkout.employee?.id || '').padStart(3, '0')}` : `${employees.length} employee records · ${period()}`}</small>
+                </div>
+                <h3 id="rp-checkout-title">Choose a test payment method</h3>
+                <div className="rp-method-grid">
+                  {[
+                    { id: 'UPI', label: 'UPI', hint: 'Test UPI collect' },
+                    { id: 'CARD', label: 'Debit / credit card', hint: 'Test card flow' },
+                    { id: 'NETBANKING', label: 'Netbanking', hint: 'Test bank redirect' },
+                    { id: 'WALLET', label: 'Wallet', hint: 'Test wallet flow' }
+                  ].map((method) => (
+                    <button key={method.id} type="button" className={`rp-method ${checkout.method === method.id ? 'selected' : ''}`} onClick={() => setCheckout((current) => ({ ...current, method: method.id }))} disabled={saving}>
+                      <span className="rp-method-radio">{checkout.method === method.id ? '●' : '○'}</span><span><b>{method.label}</b><small>{method.hint}</small></span>
+                    </button>
+                  ))}
+                </div>
+                <div className={`rp-checkout-state ${checkout.stage}`} aria-live="polite">
+                  <span className="rp-checkout-state-icon">{checkout.stage === 'complete' ? '✓' : checkout.stage === 'failed' ? '!' : checkout.stage === 'verification' ? '?' : checkout.stage === 'ready' ? '○' : '↻'}</span>
+                  <div><b>{({ ready: 'Ready to pay', authorizing: 'Authorizing test transaction', processing: 'Processing payment', complete: 'Processor response received', failed: 'Payment not confirmed', verification: 'Pending verification' })[checkout.stage]}</b><p>{checkout.message || 'This local checkout does not connect to a bank or payment gateway.'}</p></div>
+                </div>
+                {checkout.result?.payment && <div className="rp-transaction-ref"><span>Transaction reference</span><code>{checkout.result.payment.idempotency_key || `PAY-${checkout.result.payment.id || 'PENDING'}`}</code><span>Status: <b>{checkout.result.payment.status}</b></span></div>}
+                {Array.isArray(checkout.result?.payments) && <div className="rp-transaction-ref"><span>Payroll result</span><b>{checkout.result.paid_count ?? 0} confirmed · {checkout.result.failed_count ?? 0} not confirmed</b></div>}
+                <div className="rp-checkout-actions">
+                  <button className="rp-btn secondary" onClick={() => setCheckout((current) => ({ ...current, open: false }))} disabled={saving}>{checkout.stage === 'complete' || checkout.stage === 'failed' || checkout.stage === 'verification' ? 'Close' : 'Cancel'}</button>
+                  {checkout.stage === 'verification' && checkout.result?.payment?.id && (
+                    <button className="rp-btn primary" onClick={verifyCheckoutPayment} disabled={saving}>
+                      <RefreshCw size={15} /> {saving ? 'Checking…' : 'Verify transaction'}
+                    </button>
+                  )}
+                  <button className="rp-btn primary" onClick={submitCheckout} disabled={saving || checkout.stage === 'complete' || checkout.stage === 'verification' || checkout.stage === 'failed'}><Wallet size={15} /> {saving ? 'Processing…' : checkout.mode === 'single' ? 'Pay now (test)' : 'Process payroll (test)'}</button>
+                </div>
+                <p className="rp-checkout-disclaimer">Test-mode simulation inspired by familiar checkout flows. No real card details are requested, no external gateway is called, and no money is transferred.</p>
+              </section>
+            </div>
           )}
 
           <footer className="rp-footer">

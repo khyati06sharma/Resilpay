@@ -413,3 +413,38 @@ td strong { color: var(--ink); font-weight: 700; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+
+/* Payment processor rollback controls */
+.processor-panel .primary-button,
+.processor-panel .secondary-button {
+  min-height: 39px;
+  padding: 9px 14px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid var(--wine, #702b3a);
+  transition: opacity .15s ease, transform .15s ease;
+}
+.processor-panel .primary-button {
+  color: #fff;
+  background: var(--wine, #702b3a);
+}
+.processor-panel .secondary-button {
+  color: var(--wine, #702b3a);
+  background: var(--paper, #fffefc);
+}
+.processor-panel .primary-button:hover:not(:disabled),
+.processor-panel .secondary-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+.processor-panel button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+.processor-panel .processor-timeline {
+  padding: 12px 14px;
+  border: 1px solid var(--line, #e7dfd8);
+  border-radius: 9px;
+  background: var(--paper, #fffefc);
+}

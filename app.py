@@ -4,6 +4,8 @@ import threading
 import time
 import uuid
 from flask import Flask, request, jsonify, render_template
+import processor_versions
+import processor_rollback
 
 from cache import (
     get_value as cache_get,
@@ -306,6 +308,7 @@ def inject_real_network_error():
         "/api-status",
         "/chaos/api",
         "/chaos/network",
+        "/chaos/deploy-faulty",
         "/network-status",
         "/database-status",
         "/recovery-status",
@@ -379,7 +382,9 @@ def inject_real_network_error():
         normalized_path == "/add-employee"
         or normalized_path.startswith("/employees/")
         or normalized_path.startswith("/payments/employee/")
+        or normalized_path.startswith("/payments/") and normalized_path.endswith("/verify")
         or normalized_path == "/payments/run"
+        or normalized_path == "/payroll/process"
     )
 
     if api_active and api_mutation:
@@ -1062,13 +1067,13 @@ def chaos_other(kind):
 
     labels = {
         "api": "API connection failure",
-        "payment": "Payment-provider failure",
+        "payment": "Payment gateway timeout",
     }
 
     try:
         incident_id, started = incident_start(
             labels[kind],
-            f"{labels[kind]} injected; monitoring remains available.",
+            f"{labels[kind]} injected; monitoring remains available. New test payments may remain pending verification.",
         )
     except Exception:
         app.logger.exception("Could not record %s incident", kind)
@@ -1353,12 +1358,14 @@ def chaos_database():
     ), 202
 
 
-def make_payment(employee_id, run_id):
-    """Create or return one payment per employee per payroll period."""
-    key = f"resilpay-{run_id}-{employee_id}"
+def make_payment(employee_id, run_id, amount_override=None, payment_method="UPI"):
+    """Create or return a payment attempt, preserving idempotency per attempt."""
+    base_key = f"resilpay-{run_id}-{employee_id}"
     conn = get_db()
 
     try:
+        # A confirmed payment closes this employee's payroll period. Never
+        # create another attempt once PAID exists for the same period.
         already_paid = conn.execute(
             """SELECT * FROM payments
                WHERE employee_id=?
@@ -1371,14 +1378,24 @@ def make_payment(employee_id, run_id):
         if already_paid:
             return dict(already_paid), False
 
-        existing = conn.execute(
-            "SELECT * FROM payments WHERE idempotency_key=?",
-            (key,),
-        ).fetchone()
+        attempts = conn.execute(
+            """SELECT * FROM payments
+               WHERE employee_id=? AND payroll_period=?
+               ORDER BY id DESC""",
+            (employee_id, run_id),
+        ).fetchall()
 
-        if existing:
-            # Do not silently change FAILED/uncertain records to PAID.
-            return dict(existing), False
+        if attempts and attempts[0]["status"] == "PENDING_VERIFICATION":
+            # A retry is blocked until the original attempt is reconciled.
+            return dict(attempts[0]), False
+
+        if attempts and attempts[0]["status"] not in ("FAILED",):
+            # Reuse a previously recorded non-final attempt rather than
+            # generating a second charge.
+            return dict(attempts[0]), False
+
+        attempt_number = len(attempts) + 1
+        key = base_key if attempt_number == 1 else f"{base_key}-attempt-{attempt_number}"
 
         emp_row = conn.execute(
             "SELECT * FROM employees WHERE id=?",
@@ -1389,10 +1406,14 @@ def make_payment(employee_id, run_id):
             raise LookupError("Employee not found.")
 
         emp = employee_dict(emp_row)
-        amount = emp["net_salary"]
+        # Queued payroll jobs retain the salary snapshot captured when queued.
+        amount = float(amount_override) if amount_override is not None else emp["net_salary"]
 
         if amount <= 0:
             raise ValueError("Net payable must be positive.")
+
+        # Execute the active processor implementation, not only a version label.
+        processor_versions.process_payment(amount)
 
         with _state_lock:
             provider_failed = bool(_chaos.get("payment", False))
@@ -1400,18 +1421,22 @@ def make_payment(employee_id, run_id):
         if provider_failed:
             _payment_fault_observed.set()
 
-        status = "FAILED" if provider_failed else "PAID"
+        # A simulated gateway timeout is ambiguous: the request may have
+        # reached the provider, so never label it as a definite decline or
+        # automatically retry it. Persist the outcome for reconciliation.
+        status = "PENDING_VERIFICATION" if provider_failed else "PAID"
         message = (
-            "Simulated provider failure; payment was not confirmed."
+            "Gateway timeout: the test processor did not return a confirmation. "
+            "No success is assumed; verify this transaction before retrying."
             if provider_failed
-            else "Simulated payment confirmed."
+            else f"Simulated {payment_method} payment confirmed. No real money moved."
         )
 
         cur = conn.execute(
             """INSERT INTO payments
                (employee_id, employee_name, amount, idempotency_key,
-                status, message, updated_at, payroll_period)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, message, updated_at, payroll_period, payment_method)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 employee_id,
                 emp["name"],
@@ -1421,6 +1446,7 @@ def make_payment(employee_id, run_id):
                 message,
                 now(),
                 run_id,
+                payment_method,
             ),
         )
         conn.commit()
@@ -1447,17 +1473,31 @@ def pay_employee(employee_id):
         return jsonify(error="Invalid payroll run ID."), 400
 
     try:
-        payment, created = make_payment(employee_id, run_id)
+        payment_method = str(data.get("payment_method") or "UPI").upper()
+        if payment_method not in ("UPI", "CARD", "NETBANKING", "WALLET"):
+            return jsonify(error="Choose a supported test payment method."), 400
+        payment, created = make_payment(employee_id, run_id, payment_method=payment_method)
     except LookupError as exc:
         return jsonify(error=str(exc)), 404
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
+    except RuntimeError as exc:
+        conn = get_db()
+        try:
+            employee = conn.execute("SELECT id, basic_salary, hra, bonus, allowances, deductions FROM employees WHERE id=?", (employee_id,)).fetchone()
+            if not employee:
+                return jsonify(error="Employee not found."), 404
+            amount = max(0.0, float(employee["basic_salary"] or 0) + float(employee["hra"] or 0) + float(employee["bonus"] or 0) + float(employee["allowances"] or 0) - float(employee["deductions"] or 0))
+        finally:
+            conn.close()
+        job, _created = processor_rollback.enqueue_job(employee_id, run_id, amount)
+        return jsonify(success=True, queued=True, job=job, message="Processor is unhealthy; payment job was saved as pending. No payment was marked PAID.", processor_error=str(exc)), 202
 
     if payment["status"] != "PAID":
         return jsonify(
             error=payment.get("message", "Payment is not confirmed."),
             payment=payment,
-            message="Transaction is not paid. Reconcile before retrying.",
+            message=(payment.get("message") or "Transaction is not confirmed.") + " Do not retry until its status is verified.",
         ), 503
 
     return jsonify(
@@ -1481,6 +1521,10 @@ def payments_run():
 
     if not run_id:
         return jsonify(error="Invalid payroll run ID."), 400
+
+    payment_method = str(data.get("payment_method") or "UPI").upper()
+    if payment_method not in ("UPI", "CARD", "NETBANKING", "WALLET"):
+        return jsonify(error="Choose a supported test payment method."), 400
 
     employee_ids = data.get("employee_ids")
     conn = get_db()
@@ -1518,21 +1562,33 @@ def payments_run():
     results = []
     for row in rows:
         try:
-            payment, _ = make_payment(row["id"], run_id)
+            payment, _ = make_payment(row["id"], run_id, payment_method=payment_method)
             results.append(payment)
         except (LookupError, ValueError):
             continue
+        except RuntimeError as exc:
+            conn = get_db()
+            try:
+                employee = conn.execute("SELECT id, basic_salary, hra, bonus, allowances, deductions FROM employees WHERE id=?", (row["id"],)).fetchone()
+                if employee:
+                    amount = max(0.0, float(employee["basic_salary"] or 0) + float(employee["hra"] or 0) + float(employee["bonus"] or 0) + float(employee["allowances"] or 0) - float(employee["deductions"] or 0))
+                    job, _created = processor_rollback.enqueue_job(row["id"], run_id, amount)
+                    results.append({"employee_id": row["id"], "status": "PENDING", "message": "Processor unhealthy; queued safely.", "job_id": job["id"], "processor_error": str(exc)})
+            finally:
+                conn.close()
 
-    failed = sum(payment["status"] != "PAID" for payment in results)
+    failed = sum(payment["status"] not in ("PAID", "PENDING") for payment in results)
+    queued = sum(payment["status"] == "PENDING" for payment in results)
 
     return jsonify(
-        message="Payroll run finished; inspect individual payment statuses.",
+        message="Payroll run finished; inspect individual payment and job statuses.",
         run_id=run_id,
         payments=results,
         failed_count=failed,
-        paid_count=len(results) - failed,
+        queued_count=queued,
+        paid_count=sum(payment["status"] == "PAID" for payment in results),
         real_money_transferred=False,
-    ), (503 if failed else 200)
+    ), (202 if queued else (503 if failed else 200))
 
 
 @app.route("/payments")
@@ -1549,6 +1605,167 @@ def payments():
     finally:
         conn.close()
 
+
+
+@app.route("/payments/<int:payment_id>/verify", methods=["POST"])
+def verify_payment(payment_id):
+    """Reconcile a pending local test transaction after the gateway recovers.
+
+    This simulator never contacts a real provider. While the injected gateway
+    fault is active, the result remains unknown. Once recovered, the local
+    test ledger can confirm that no simulated charge was recorded and mark
+    this attempt FAILED so a new idempotent attempt may be created safely.
+    """
+    with _state_lock:
+        gateway_fault_active = bool(_chaos.get("payment", False))
+
+    if gateway_fault_active:
+        return jsonify(
+            success=False,
+            status="PENDING_VERIFICATION",
+            message="The simulated gateway is still unavailable. Check again after recovery.",
+        ), 409
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM payments WHERE id=?", (payment_id,)
+        ).fetchone()
+        if not row:
+            return jsonify(success=False, message="Payment transaction not found."), 404
+
+        payment = dict(row)
+        if payment["status"] == "PAID":
+            return jsonify(
+                success=True,
+                status="PAID",
+                payment=payment,
+                message="This transaction is already confirmed as paid. Do not create another payment.",
+            ), 200
+
+        if payment["status"] != "PENDING_VERIFICATION":
+            return jsonify(
+                success=True,
+                status=payment["status"],
+                payment=payment,
+                message=f"This transaction is already marked {payment['status']}.",
+            ), 200
+
+        # In this local simulator, an injected timeout does not write a charge
+        # to a provider ledger. Once the fault clears, reconciliation confirms
+        # this attempt did not charge and a separate retry is safe.
+        message = (
+            "Verified in local test mode: no simulated charge was recorded. "
+            "You can safely start a new payment attempt."
+        )
+        conn.execute(
+            """UPDATE payments SET status='FAILED', message=?, updated_at=?
+               WHERE id=? AND status='PENDING_VERIFICATION'""",
+            (message, now(), payment_id),
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM payments WHERE id=?", (payment_id,)
+        ).fetchone()
+        return jsonify(
+            success=True,
+            status="FAILED",
+            payment=dict(updated),
+            message=message,
+            safe_to_retry=True,
+            real_money_transferred=False,
+        ), 200
+    finally:
+        conn.close()
+
+
+# --- Simulated processor deployment / rollback API ---
+processor_rollback.init_storage()
+processor_versions.health_check()
+
+
+def _resume_processor_job(employee_id, payroll_period, amount):
+    """Resume the persisted salary snapshot after checking payment idempotency."""
+    payment, _created = make_payment(int(employee_id), str(payroll_period), amount_override=float(amount))
+    return payment
+
+
+processor_rollback.configure_job_processor(_resume_processor_job)
+
+
+@app.route("/processor-status", methods=["GET"])
+@app.route("/api/processor-status", methods=["GET"])
+def processor_status():
+    return jsonify(processor_rollback.get_status()), 200
+
+
+@app.route("/processor-incidents", methods=["GET"])
+@app.route("/api/processor-incidents", methods=["GET"])
+def processor_incidents():
+    return jsonify(incidents=processor_rollback.get_incidents()), 200
+
+
+@app.route("/processor-events", methods=["GET"])
+@app.route("/api/processor-events", methods=["GET"])
+def processor_events():
+    return jsonify(events=processor_rollback.get_events()), 200
+
+
+@app.route("/processor-payments", methods=["GET"])
+@app.route("/api/processor-payments", methods=["GET"])
+def processor_payments():
+    return jsonify(payments=processor_rollback.get_payments()), 200
+
+
+@app.route("/chaos/deploy-faulty", methods=["POST"])
+@app.route("/api/chaos/deploy-faulty", methods=["POST"])
+def deploy_faulty_processor():
+    result, status_code = processor_rollback.deploy_faulty_version()
+    return jsonify(result), status_code
+
+
+@app.route("/payroll/process", methods=["POST"])
+@app.route("/api/payroll/process", methods=["POST"])
+def process_payroll_with_processor():
+    """Queue jobs while unhealthy; otherwise process idempotently."""
+    data = request.get_json(silent=True) or {}
+    payroll_period = str(data.get("payroll_period") or data.get("run_id") or datetime.now().strftime("%Y-%m"))
+    payroll_period = "".join(ch for ch in payroll_period if ch.isalnum() or ch in "-_")[:80]
+    if not payroll_period:
+        return jsonify(error="Invalid payroll period."), 400
+
+    conn = get_db()
+    try:
+        employees = conn.execute(
+            "SELECT id, basic_salary, hra, bonus, allowances, deductions FROM employees ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    health = processor_versions.health_check()
+    recovering = processor_versions.get_deployment_status() in ("deploying", "detecting", "rolling_back", "verifying")
+    results = []
+    if not health["healthy"] or recovering:
+        for employee in employees:
+            amount = max(0.0, float(employee["basic_salary"] or 0) + float(employee["hra"] or 0) + float(employee["bonus"] or 0) + float(employee["allowances"] or 0) - float(employee["deductions"] or 0))
+            job, created = processor_rollback.enqueue_job(employee["id"], payroll_period, amount)
+            results.append({"employee_id": employee["id"], "status": job["status"], "job_id": job["id"], "created": created})
+        return jsonify(message="Processor unhealthy or recovering; payroll jobs are persisted and will be resumed only after verified rollback.", payroll_period=payroll_period, queued_count=len(results), results=results, real_money_transferred=False), 202
+
+    for employee in employees:
+        try:
+            payment, created = make_payment(employee["id"], payroll_period)
+            results.append({"employee_id": employee["id"], "status": payment.get("status"), "payment_id": payment.get("id"), "created": created})
+        except (LookupError, ValueError) as exc:
+            results.append({"employee_id": employee["id"], "status": "FAILED", "message": str(exc)})
+        except RuntimeError as exc:
+            amount = max(0.0, float(employee["basic_salary"] or 0) + float(employee["hra"] or 0) + float(employee["bonus"] or 0) + float(employee["allowances"] or 0) - float(employee["deductions"] or 0))
+            job, created = processor_rollback.enqueue_job(employee["id"], payroll_period, amount)
+            results.append({"employee_id": employee["id"], "status": job["status"], "job_id": job["id"], "created": created, "message": str(exc)})
+
+    queued = sum(item.get("status") == "Pending" for item in results)
+    failed = sum(item.get("status") == "FAILED" for item in results)
+    return jsonify(message="Simulated payroll processing finished.", payroll_period=payroll_period, results=results, paid_count=sum(item.get("status") == "PAID" for item in results), queued_count=queued, failed_count=failed, real_money_transferred=False), (202 if queued else (503 if failed else 200))
 
 if __name__ == "__main__":
     app.run(

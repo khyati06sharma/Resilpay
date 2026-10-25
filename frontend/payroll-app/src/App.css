@@ -502,3 +502,41 @@ button { cursor: pointer; }
   .rp-panel { padding: 14px; }
   .rp-panel-title { align-items: flex-start; flex-direction: column; }
 }
+
+
+/* Simulated checkout: Razorpay-style test-mode interaction, not a real gateway. */
+.rp-checkout-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 18px; background: rgba(35, 22, 26, .58); backdrop-filter: blur(3px); }
+.rp-checkout { width: min(100%, 520px); max-height: min(92vh, 850px); overflow-y: auto; background: var(--paper); border: 1px solid var(--line); border-radius: 15px; box-shadow: 0 24px 80px #160c1050; padding: 22px; color: var(--ink); }
+.rp-checkout-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.rp-checkout-brand { display: flex; align-items: center; gap: 11px; }
+.rp-checkout-mark { width: 38px; height: 38px; display: grid; place-items: center; background: var(--wine); color: white; border-radius: 10px; font-weight: 900; font-size: 19px; }
+.rp-checkout-brand strong, .rp-checkout-brand small { display: block; }
+.rp-checkout-brand strong { font-size: 14px; }
+.rp-checkout-brand small { margin-top: 4px; color: var(--muted); font-size: 8px; letter-spacing: .8px; }
+.rp-checkout-close { width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 8px; background: white; font-size: 23px; color: var(--muted); }
+.rp-checkout-amount { margin: 20px 0; padding: 20px; border-radius: 11px; background: #f7f1ec; text-align: center; }
+.rp-checkout-amount span, .rp-checkout-amount small { display: block; color: var(--muted); font-size: 11px; }
+.rp-checkout-amount strong { display: block; margin: 7px 0; font-size: 30px; letter-spacing: -.8px; }
+.rp-checkout h3 { margin: 0 0 12px; font-size: 13px; }
+.rp-method-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.rp-method { display: flex; align-items: flex-start; gap: 10px; padding: 13px 11px; border: 1px solid var(--line); border-radius: 9px; text-align: left; background: white; color: var(--ink); }
+.rp-method.selected { border-color: var(--wine); background: #fbf2f3; box-shadow: 0 0 0 1px var(--wine) inset; }
+.rp-method-radio { color: var(--wine); font-size: 14px; }
+.rp-method b, .rp-method small { display: block; }
+.rp-method b { font-size: 11px; }
+.rp-method small { margin-top: 5px; color: var(--muted); font-size: 9px; }
+.rp-checkout-state { display: flex; align-items: flex-start; gap: 11px; margin-top: 15px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: #fbfaf8; }
+.rp-checkout-state-icon { display: grid; place-items: center; flex: 0 0 27px; height: 27px; border-radius: 50%; background: #eee7e1; color: var(--wine); font-weight: 900; }
+.rp-checkout-state b { font-size: 11px; }
+.rp-checkout-state p { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.rp-checkout-state.complete { border-color: #b7d2be; background: #edf6ef; }
+.rp-checkout-state.complete .rp-checkout-state-icon { background: #d7ebdc; color: #27613c; }
+.rp-checkout-state.failed, .rp-checkout-state.verification { border-color: #e3c2a0; background: #fff4e6; }
+.rp-checkout-state.failed .rp-checkout-state-icon, .rp-checkout-state.verification .rp-checkout-state-icon { background: #f4dfc4; color: #8a4b16; }
+.rp-transaction-ref { display: flex; flex-wrap: wrap; gap: 7px 12px; align-items: center; padding: 11px 0 0; font-size: 10px; }
+.rp-transaction-ref span { color: var(--muted); }
+.rp-transaction-ref code { overflow-wrap: anywhere; color: var(--wine); }
+.rp-checkout-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
+.rp-checkout-disclaimer { margin: 14px 0 0; color: var(--muted); font-size: 9px; line-height: 1.6; }
+.rp-status.pending_verification { background: #fff0d9; color: #8a4b16; }
+@media (max-width: 480px) { .rp-checkout { padding: 15px; } .rp-method-grid { grid-template-columns: 1fr; } .rp-checkout-actions { flex-direction: column-reverse; } .rp-checkout-actions .rp-btn { width: 100%; } }
