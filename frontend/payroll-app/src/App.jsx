@@ -118,6 +118,9 @@ export default function App() {
 
   const [queueInfo, setQueueInfo] = useState(emptyQueueSummary);
   const [queueItems, setQueueItems] = useState([]);
+  const [showQueueHistory, setShowQueueHistory] = useState(false);
+  const [queueHistoryFilter, setQueueHistoryFilter] = useState('All operations');
+  const [queueHistorySearch, setQueueHistorySearch] = useState('');
 
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState(null);
@@ -353,6 +356,32 @@ export default function App() {
   const pendingQueueItems = queueItems.filter((item) =>
     ['Queued', 'Processing', 'NeedsReconciliation'].includes(item.status)
   );
+
+  const recentQueueItems = [...queueItems]
+    .sort((a, b) => {
+      const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return bTime - aTime;
+    })
+    .slice(0, 3);
+
+  const filteredQueueHistory = [...queueItems]
+    .sort((a, b) => {
+      const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return bTime - aTime;
+    })
+    .filter((item) => {
+      const status = String(item.status || '').toLowerCase();
+      if (queueHistoryFilter === 'Remaining' && !['queued', 'processing'].includes(status)) return false;
+      if (queueHistoryFilter === 'Completed' && status !== 'completed') return false;
+      if (queueHistoryFilter === 'Failed' && status !== 'failed') return false;
+      if (queueHistoryFilter === 'Needs review' && !['needsreconciliation', 'needs_reconciliation', 'needs review', 'needs_review'].includes(status)) return false;
+      const query = queueHistorySearch.trim().toLowerCase();
+      if (!query) return true;
+      return [item.method, item.path, item.queue_id, item.status, item.result?.message]
+        .some((value) => String(value ?? '').toLowerCase().includes(query));
+    });
 
   useEffect(() => {
     if (!selected) return;
@@ -1056,86 +1085,6 @@ export default function App() {
             </form>
           )}
 
-          <section className="rp-panel" style={{ marginBottom: 16 }}>
-            <div className="rp-panel-title">
-              <div>
-                <h2>
-                  <ListChecks size={18} style={{ verticalAlign: 'middle' }} />{' '}
-                  Recovery queue
-                </h2>
-                <p>
-                  Queued changes are not saved until their status is Completed.
-                </p>
-              </div>
-              <span className="rp-count">{queueInfo.pending} PENDING</span>
-            </div>
-
-            <div className="rp-overview-grid">
-              <div><span>Queued</span><strong>{queueInfo.queued}</strong></div>
-              <div><span>Processing</span><strong>{queueInfo.processing}</strong></div>
-              <div><span>Completed</span><strong>{queueInfo.completed}</strong></div>
-              <div><span>Failed</span><strong>{queueInfo.failed}</strong></div>
-              <div>
-                <span>Needs review</span>
-                <strong>{queueInfo.needs_reconciliation}</strong>
-              </div>
-            </div>
-
-            <div className="rp-table-wrap">
-              <table className="rp-table">
-                <thead>
-                  <tr>
-                    <th>OPERATION</th>
-                    <th>STATUS</th>
-                    <th>CREATED</th>
-                    <th>RESULT</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {queueItems.map((item) => (
-                    <tr key={item.queue_id}>
-                      <td>
-                        <b>{item.method}</b> {item.path}
-                        <small style={{ display: 'block' }}>
-                          ID: {item.queue_id}
-                        </small>
-                      </td>
-                      <td>
-                        <span
-                          className={`rp-status ${String(item.status || '').toLowerCase()}`}
-                        >
-                          {item.status}
-                        </span>
-                      </td>
-                      <td>
-                        {item.created_at
-                          ? new Date(item.created_at).toLocaleString()
-                          : '—'}
-                      </td>
-                      <td>
-                        {item.result?.message || 'Waiting for processing'}
-                      </td>
-                    </tr>
-                  ))}
-
-                  {!queueItems.length && (
-                    <tr>
-                      <td colSpan="4" className="rp-empty">
-                        No queued operations.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            {pendingQueueItems.length > 0 && (
-              <p className="rp-footnote">
-                Pending changes are not yet confirmed in the database. Keep
-                this page open to follow their status.
-              </p>
-            )}
-          </section>
 
           <section className="rp-metrics">
             <article className="rp-metric">
@@ -1202,6 +1151,98 @@ export default function App() {
                   </div>
                 </div>
               </section>
+
+          <section className="rp-panel rp-queue-panel" style={{ marginBottom: 16 }}>
+            <div className="rp-panel-title rp-queue-heading">
+              <div>
+                <h2><ListChecks size={18} style={{ verticalAlign: 'middle' }} /> Recovery queue</h2>
+                <p>Recent operations and their latest recovery status.</p>
+              </div>
+              <button type="button" className="rp-btn primary rp-view-queue" onClick={() => setShowQueueHistory(true)}>
+                <History size={14} /> View all queue
+              </button>
+            </div>
+            <div className="rp-queue-summary">
+              <div><span>Queued</span><strong>{queueInfo.queued}</strong></div>
+              <div><span>Processing</span><strong>{queueInfo.processing}</strong></div>
+              <div><span>Completed</span><strong>{queueInfo.completed}</strong></div>
+              <div><span>Failed</span><strong>{queueInfo.failed}</strong></div>
+              <div><span>Needs review</span><strong>{queueInfo.needs_reconciliation}</strong></div>
+            </div>
+            <div className="rp-queue-recent-list">
+              {recentQueueItems.map((item) => (
+                <div className="rp-queue-recent-row" key={item.queue_id}>
+                  <div className="rp-queue-recent-operation">
+                    <strong>{item.method} {item.path}</strong>
+                    <small>ID: {item.queue_id}</small>
+                  </div>
+                  <span className={`rp-status ${String(item.status || '').toLowerCase()}`}>{item.status}</span>
+                  <span className="rp-queue-recent-result">{item.result?.message || 'Waiting for processing'}</span>
+                  <time>{item.created_at ? new Date(item.created_at).toLocaleString() : '—'}</time>
+                </div>
+              ))}
+              {!recentQueueItems.length && <div className="rp-queue-empty">No queue operations yet.</div>}
+            </div>
+            {pendingQueueItems.length > 0 && (
+              <p className="rp-footnote">Pending changes are not yet confirmed in the database. Keep this page open to follow their status.</p>
+            )}
+          </section>
+
+          {showQueueHistory && (
+            <div className="rp-queue-modal-backdrop" role="presentation" onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setShowQueueHistory(false);
+            }}>
+              <section className="rp-queue-modal" role="dialog" aria-modal="true" aria-labelledby="rp-queue-modal-title">
+                <header className="rp-queue-modal-header">
+                  <div>
+                    <h2 id="rp-queue-modal-title"><History size={19} /> Recovery queue history</h2>
+                    <p>Review all queued operations, their latest status and results.</p>
+                  </div>
+                  <button type="button" className="rp-queue-modal-close" aria-label="Close queue history" onClick={() => setShowQueueHistory(false)}><X size={19} /></button>
+                </header>
+                <div className="rp-queue-modal-stats">
+                  <div><span>Remaining</span><strong>{queueInfo.queued + queueInfo.processing}</strong></div>
+                  <div><span>Completed</span><strong>{queueInfo.completed}</strong></div>
+                  <div><span>Failed</span><strong>{queueInfo.failed}</strong></div>
+                  <div><span>Needs review</span><strong>{queueInfo.needs_reconciliation}</strong></div>
+                </div>
+                <div className="rp-queue-history-controls">
+                  <div className="rp-queue-filter-tabs" role="group" aria-label="Filter queue history">
+                    {['All operations', 'Remaining', 'Completed', 'Failed', 'Needs review'].map((filter) => (
+                      <button type="button" key={filter} className={queueHistoryFilter === filter ? 'active' : ''} onClick={() => setQueueHistoryFilter(filter)}>{filter}</button>
+                    ))}
+                  </div>
+                  <label className="rp-queue-search">
+                    <Search size={16} />
+                    <input value={queueHistorySearch} onChange={(event) => setQueueHistorySearch(event.target.value)} placeholder="Search operation, ID or result…" aria-label="Search queue history" />
+                    {queueHistorySearch && <button type="button" aria-label="Clear search" onClick={() => setQueueHistorySearch('')}><X size={14} /></button>}
+                  </label>
+                </div>
+                <div className="rp-table-wrap rp-queue-history-table-wrap">
+                  <table className="rp-table rp-queue-history-table">
+                    <thead><tr><th>OPERATION</th><th>STATUS</th><th>CREATED</th><th>RESULT</th></tr></thead>
+                    <tbody>
+                      {filteredQueueHistory.map((item) => (
+                        <tr key={item.queue_id}>
+                          <td><b>{item.method} {item.path}</b><small style={{ display: 'block' }}>ID: {item.queue_id}</small></td>
+                          <td><span className={`rp-status ${String(item.status || '').toLowerCase()}`}>{item.status}</span></td>
+                          <td>{item.created_at ? new Date(item.created_at).toLocaleString() : '—'}</td>
+                          <td>{item.result?.message || 'Waiting for processing'}</td>
+                        </tr>
+                      ))}
+                      {!filteredQueueHistory.length && <tr><td colSpan="4" className="rp-empty">No operations match this filter.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+                <footer className="rp-queue-modal-footer">
+                  <span>{filteredQueueHistory.length} operation{filteredQueueHistory.length === 1 ? '' : 's'}</span>
+                  <button type="button" className="rp-btn" onClick={() => { setQueueHistoryFilter('All operations'); setQueueHistorySearch(''); }}>Reset filters</button>
+                  <button type="button" className="rp-btn primary" onClick={() => setShowQueueHistory(false)}>Close</button>
+                </footer>
+              </section>
+            </div>
+          )}
+
 
               <section className="rp-panel">
                 <div className="rp-panel-title">

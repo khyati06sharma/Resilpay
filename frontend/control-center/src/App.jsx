@@ -82,6 +82,9 @@ function App() {
   const [databaseStatus, setDatabaseStatus] = useState({});
   const [apiStatus, setApiStatus] = useState({});
   const [queueState, setQueueState] = useState({ summary: {}, items: [] });
+  const [queueModalOpen, setQueueModalOpen] = useState(false);
+  const [queueFilter, setQueueFilter] = useState("All operations");
+  const [queueSearch, setQueueSearch] = useState("");
   const [cacheState, setCacheState] = useState({});
   const [recoveryState, setRecoveryState] = useState({ recoveries: {}, stages: [] });
   const [loading, setLoading] = useState(true);
@@ -250,6 +253,7 @@ function App() {
     { label: "Incident Timeline", icon: "◷" },
     { label: "Chaos Lab", icon: "⚡" },
     { label: "Payroll Snapshot", icon: "▤" },
+    { label: "Processor Recovery", icon: "↻" },
   ];
 
   return (
@@ -320,6 +324,9 @@ function App() {
             <span>ResilPay</span><span className="crumb-separator">/</span><strong>{page}</strong>
           </div>
           <div className="topbar-actions">
+            <a className="payroll-return-link" href="http://localhost:5173/" title="Return to Payroll app">
+              <span aria-hidden="true">←</span> Payroll app
+            </a>
             <div className="system-pill"><span className="live-dot" /> Live monitoring</div>
             <button className="icon-button" onClick={refreshNow} disabled={refreshing} title="Refresh data">
               {refreshing ? "…" : "↻"}
@@ -349,17 +356,46 @@ function App() {
               <button onClick={refreshNow}>Retry</button>
             </div>
           )}
-          <section className="metric-grid" style={{marginBottom:16}}>
+          <section className="metric-grid overview-quick-metrics">
             <Metric label="Recovery queue pending" value={queueState.summary?.pending ?? "—"} note={`${queueState.summary?.completed ?? 0} completed · ${queueState.summary?.failed ?? 0} failed`} icon="⇄" />
-            <Metric label="Read cache entries" value={cacheState.items ?? "—"} note="Last-known-good read snapshots" icon="▤" />
+            <Metric label="Read cache entries" value={cacheState.items ?? "—"} note="Saved read snapshots" icon="▤" />
           </section>
-          {queueState.items?.length > 0 && (
-            <section className="panel" style={{marginBottom:16}}>
-              <div className="panel-heading"><div><h2>Recovery queue</h2><p>Queued writes are not considered saved until confirmed.</p></div></div>
+          <section className="panel recovery-queue-panel">
+            <div className="panel-heading">
+              <div><h2>Recovery queue</h2><p>Latest operations and their current status.</p></div>
+              <button className="queue-btn queue-view-all" onClick={() => setQueueModalOpen(true)}>View all queue</button>
+            </div>
+            {queueState.items?.length ? (
               <div className="table-wrap"><table><thead><tr><th>Operation</th><th>Status</th><th>Updated</th><th>Result</th></tr></thead><tbody>
-                {queueState.items.slice(0,8).map(item => <tr key={item.queue_id}><td>{item.method} {item.path}</td><td><Badge status={statusOf(item.status)}>{item.status}</Badge></td><td>{formatDate(item.updated_at)}</td><td>{item.result?.message || (item.status === "Queued" ? "Waiting for recovery" : "—")}</td></tr>)}
+                {queueState.items.slice(0,3).map(item => <tr key={item.queue_id}><td>{item.method} {item.path}</td><td><Badge status={statusOf(item.status)}>{item.status}</Badge></td><td>{formatDate(item.updated_at)}</td><td>{item.result?.message || (item.status === "Queued" ? "Waiting for recovery" : "—")}</td></tr>)}
               </tbody></table></div>
-            </section>
+            ) : <div className="queue-empty">No queue operations have been recorded yet.</div>}
+          </section>
+          {queueModalOpen && (
+            <div className="queue-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setQueueModalOpen(false); }}>
+              <section className="queue-modal" role="dialog" aria-modal="true" aria-labelledby="queue-modal-title">
+                <div className="queue-modal-header"><div><h2 id="queue-modal-title">Recovery queue history</h2><p>Review completed operations and work that still needs attention.</p></div><button className="queue-modal-close" aria-label="Close queue history" onClick={() => setQueueModalOpen(false)}>×</button></div>
+                <div className="queue-modal-tools">
+                  <div className="queue-filter-row">{["All operations", "Remaining", "Completed", "Failed", "Needs review"].map(filter => <button key={filter} className={`queue-filter ${queueFilter === filter ? "active" : ""}`} onClick={() => setQueueFilter(filter)}>{filter}</button>)}</div>
+                  <input className="queue-search" value={queueSearch} onChange={event => setQueueSearch(event.target.value)} placeholder="Search operation, status or result…" aria-label="Search queue history" />
+                </div>
+                <div className="table-wrap queue-modal-table"><table><thead><tr><th>Operation</th><th>Status</th><th>Updated</th><th>Result</th></tr></thead><tbody>
+                  {queueState.items.filter(item => {
+                    const status = String(item.status || "").toLowerCase();
+                    const matchesFilter = queueFilter === "All operations" || (queueFilter === "Remaining" && /queued|processing|pending|retry/i.test(status)) || (queueFilter === "Completed" && /complete|success|saved/i.test(status)) || (queueFilter === "Failed" && /fail|error/i.test(status)) || (queueFilter === "Needs review" && /review|verify|uncertain/i.test(status));
+                    const haystack = `${item.method || ""} ${item.path || ""} ${item.status || ""} ${item.result?.message || ""}`.toLowerCase();
+                    return matchesFilter && haystack.includes(queueSearch.toLowerCase());
+                  }).map(item => <tr key={item.queue_id}><td>{item.method} {item.path}</td><td><Badge status={statusOf(item.status)}>{item.status}</Badge></td><td>{formatDate(item.updated_at)}</td><td>{item.result?.message || (item.status === "Queued" ? "Waiting for recovery" : "—")}</td></tr>)}
+                  {queueState.items.filter(item => {
+                    const status = String(item.status || "").toLowerCase();
+                    const matchesFilter = queueFilter === "All operations" || (queueFilter === "Remaining" && /queued|processing|pending|retry/i.test(status)) || (queueFilter === "Completed" && /complete|success|saved/i.test(status)) || (queueFilter === "Failed" && /fail|error/i.test(status)) || (queueFilter === "Needs review" && /review|verify|uncertain/i.test(status));
+                    const haystack = `${item.method || ""} ${item.path || ""} ${item.status || ""} ${item.result?.message || ""}`.toLowerCase();
+                    return matchesFilter && haystack.includes(queueSearch.toLowerCase());
+                  }).length === 0 && <tr><td colSpan="4" className="queue-no-results">No operations match this filter.</td></tr>}
+                </tbody></table></div>
+                <div className="queue-modal-footer"><span>{queueState.items.length} total recorded operations</span><button className="queue-btn queue-btn-primary" onClick={() => setQueueModalOpen(false)}>Close</button></div>
+              </section>
+            </div>
           )}
           {actionMessage && (
             <div className="notice notice-info">
@@ -384,52 +420,6 @@ function App() {
                 <Metric label="Avg. recovery time" value={averageRecovery} note="From recorded recoveries" icon="↻" />
                 <Metric label="Employees" value={employees.length} note="Currently registered" icon="♙" />
               </div>
-
-              <section className="panel processor-panel" style={{marginTop:16, marginBottom:16}}>
-                <div className="panel-heading">
-                  <div><h2>Payment processor rollback</h2><p>Real processor health checks, automatic rollback, and persisted job outcomes.</p></div>
-                  <Badge status={processorStatus.health?.healthy ? "healthy" : processorStatus.deployment_status === "stable" ? "failed" : "warning"}>
-                    {processorStatus.health?.healthy ? "Healthy" : processorStatus.deployment_status || "Checking"}
-                  </Badge>
-                </div>
-                <div className="metrics-grid">
-                  <Metric label="Active processor" value={`v${processorStatus.active_version || "1.0"}`} note={processorStatus.deployment_status || "status unavailable"} icon="⇄" />
-                  <Metric label="Health check" value={processorStatus.health?.healthy == null ? "CHECKING" : processorStatus.health.healthy ? "PASS" : "FAIL"} note={processorStatus.health?.detail || "Waiting for backend"} icon="◎" />
-                  <Metric label="Pending jobs" value={processorStatus.pending_jobs ?? 0} note="Persisted in SQLite" icon="◷" />
-                  <Metric label="Last recovery" value={processorStatus.last_recovery_seconds != null ? `${processorStatus.last_recovery_seconds}s` : "—"} note="Measured by backend controller" icon="↻" />
-                </div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:10,margin:"14px 0"}}>
-                  <button className="primary-button" disabled={Boolean(processorBusy) || ["deploying","detecting","diagnosing","rolling_back","verifying"].includes(processorStatus.deployment_status)} onClick={() => runProcessorAction("deploy")}>
-                    {processorBusy === "deploy" ? "Deploying…" : "Deploy Faulty Version v2.0"}
-                  </button>
-                  <button className="secondary-button" disabled={Boolean(processorBusy)} onClick={() => runProcessorAction("process")}>
-                    {processorBusy === "process" ? "Processing…" : "Process Payroll"}
-                  </button>
-                </div>
-                <div className="processor-timeline">
-                  <h3 style={{margin:"4px 0 10px"}}>Live recovery timeline</h3>
-                  {(processorStatus.timeline || []).length ? (processorStatus.timeline || []).map((event) => (
-                    <div key={event.id} style={{display:"grid",gridTemplateColumns:"14px minmax(0,1fr) auto",gap:10,alignItems:"start",padding:"9px 0",borderBottom:"1px solid var(--line, #e7dfd8)"}}>
-                      <span style={{width:9,height:9,marginTop:5,borderRadius:99,background:event.status === "success" ? "#47745c" : event.status === "failed" ? "#b34d4d" : "#9b7541"}} />
-                      <div><strong style={{fontSize:13}}>{event.event_type.replaceAll("_"," ")}</strong><div style={{fontSize:12,color:"var(--muted,#82797a)"}}>{event.message}</div></div>
-                      <small style={{fontSize:11,color:"var(--muted,#82797a)"}}>{formatDate(event.created_at)}</small>
-                    </div>
-                  )) : <div className="empty-state">No processor deployment has been recorded yet.</div>}
-                </div>
-                <div className="table-wrap" style={{marginTop:14}}>
-                  <table><thead><tr><th>Incident</th><th>Failed version</th><th>Restored version</th><th>Status</th><th>Recovery time</th></tr></thead>
-                    <tbody>{processorIncidents.slice(0,5).map((incident) => <tr key={incident.id}><td><strong>{incident.failure_type}</strong><small>{incident.diagnosis}</small></td><td>{incident.failed_version}</td><td>{incident.restored_version || "—"}</td><td><Badge status={statusOf(incident.status)}>{incident.status}</Badge></td><td>{incident.recovery_seconds != null ? `${incident.recovery_seconds}s` : "—"}</td></tr>)}
-                    {!processorIncidents.length && <tr><td colSpan="5" className="empty-state">No processor incidents yet.</td></tr>}</tbody>
-                  </table>
-                </div>
-                <div className="table-wrap" style={{marginTop:14}}>
-                  <h3 style={{margin:"4px 0 10px"}}>Payroll jobs</h3>
-                  <table><thead><tr><th>Employee</th><th>Period</th><th>Amount</th><th>Status</th><th>Updated</th></tr></thead>
-                    <tbody>{(processorStatus.jobs || []).slice(0,8).map((job) => <tr key={job.id}><td>Employee #{job.employee_id}</td><td>{job.payroll_period}</td><td>{formatMoney(job.amount)}</td><td><Badge status={statusOf(job.status)}>{job.status}</Badge><small>{job.message}</small></td><td>{formatDate(job.updated_at)}</td></tr>)}
-                    {!(processorStatus.jobs || []).length && <tr><td colSpan="5" className="empty-state">No processor jobs recorded yet.</td></tr>}</tbody>
-                  </table>
-                </div>
-              </section>
 
               <section className="content-grid">
                 <article className="panel service-panel">
@@ -563,6 +553,61 @@ function App() {
                 <IncidentTable incidents={incidents.slice(0, 5)} />
               </section>
             </>
+          )}
+
+          {page === "Processor Recovery" && (
+            <section className="processor-page">
+              <section className="section-heading">
+                <div><h2>Processor recovery</h2><p>Test a deployment and watch automatic rollback if health checks fail.</p></div>
+                <Badge status={processorStatus.health?.healthy ? "healthy" : "warning"}>{processorStatus.health?.healthy ? "Healthy" : "Checking"}</Badge>
+              </section>
+              <section className="panel processor-panel" style={{marginTop:16, marginBottom:16}}>
+                <div className="panel-heading">
+                  <div><h2>Processor recovery</h2><p>Monitor test deployments, automatic rollback and payroll job results.</p></div>
+                  <Badge status={processorStatus.health?.healthy ? "healthy" : processorStatus.deployment_status === "stable" ? "failed" : "warning"}>
+                    {processorStatus.health?.healthy ? "Healthy" : processorStatus.deployment_status || "Checking"}
+                  </Badge>
+                </div>
+                <div className="metrics-grid">
+                  <Metric label="Active version" value={`v${processorStatus.active_version || "1.0"}`} note={processorStatus.deployment_status || "status unavailable"} icon="⇄" />
+                  <Metric label="Health status" value={processorStatus.health?.healthy == null ? "CHECKING" : processorStatus.health.healthy ? "PASS" : "FAIL"} note={processorStatus.health?.detail || "Waiting for backend"} icon="◎" />
+                  <Metric label="Pending jobs" value={processorStatus.pending_jobs ?? 0} note="Persisted in SQLite" icon="◷" />
+                  <Metric label="Last rollback" value={processorStatus.last_recovery_seconds != null ? `${processorStatus.last_recovery_seconds}s` : "—"} note="Measured by backend controller" icon="↻" />
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10,margin:"14px 0"}}>
+                  <button className="primary-button" disabled={Boolean(processorBusy) || ["deploying","detecting","diagnosing","rolling_back","verifying"].includes(processorStatus.deployment_status)} onClick={() => runProcessorAction("deploy")}>
+                    {processorBusy === "deploy" ? "Deploying…" : "Deploy test version v2.0"}
+                  </button>
+                  <button className="secondary-button" disabled={Boolean(processorBusy)} onClick={() => runProcessorAction("process")}>
+                    {processorBusy === "process" ? "Processing…" : "Process test payroll"}
+                  </button>
+                </div>
+                <div className="processor-timeline">
+                  <h3 style={{margin:"4px 0 10px"}}>Recovery steps</h3>
+                  {(processorStatus.timeline || []).length ? (processorStatus.timeline || []).slice(0, 5).map((event) => (
+                    <div key={event.id} style={{display:"grid",gridTemplateColumns:"14px minmax(0,1fr) auto",gap:10,alignItems:"start",padding:"9px 0",borderBottom:"1px solid var(--line, #e7dfd8)"}}>
+                      <span style={{width:9,height:9,marginTop:5,borderRadius:99,background:event.status === "success" ? "#47745c" : event.status === "failed" ? "#b34d4d" : "#9b7541"}} />
+                      <div><strong style={{fontSize:13}}>{event.event_type.replaceAll("_"," ")}</strong><div style={{fontSize:12,color:"var(--muted,#82797a)"}}>{event.message}</div></div>
+                      <small style={{fontSize:11,color:"var(--muted,#82797a)"}}>{formatDate(event.created_at)}</small>
+                    </div>
+                  )) : <div className="empty-state">No test deployment yet. Deploy a test version to view recovery steps.</div>}
+                </div>
+                <div className="table-wrap" style={{marginTop:14}}>
+                  <table><thead><tr><th>Incident</th><th>Failed version</th><th>Restored version</th><th>Status</th><th>Recovery time</th></tr></thead>
+                    <tbody>{processorIncidents.slice(0,5).map((incident) => <tr key={incident.id}><td><strong>{incident.failure_type}</strong><small>{incident.diagnosis}</small></td><td>{incident.failed_version}</td><td>{incident.restored_version || "—"}</td><td><Badge status={statusOf(incident.status)}>{incident.status}</Badge></td><td>{incident.recovery_seconds != null ? `${incident.recovery_seconds}s` : "—"}</td></tr>)}
+                    {!processorIncidents.length && <tr><td colSpan="5" className="empty-state">No rollback incidents recorded.</td></tr>}</tbody>
+                  </table>
+                </div>
+                <div className="table-wrap" style={{marginTop:14}}>
+                  <h3 style={{margin:"4px 0 10px"}}>Recent payroll jobs</h3>
+                  <table><thead><tr><th>Employee</th><th>Period</th><th>Amount</th><th>Status</th><th>Updated</th></tr></thead>
+                    <tbody>{(processorStatus.jobs || []).slice(0,5).map((job) => <tr key={job.id}><td>Employee #{job.employee_id}</td><td>{job.payroll_period}</td><td>{formatMoney(job.amount)}</td><td><Badge status={statusOf(job.status)}>{job.status}</Badge><small>{job.message}</small></td><td>{formatDate(job.updated_at)}</td></tr>)}
+                    {!(processorStatus.jobs || []).length && <tr><td colSpan="5" className="empty-state">No payroll jobs recorded yet.</td></tr>}</tbody>
+                  </table>
+                </div>
+              </section>
+
+            </section>
           )}
 
           {page === "Incident Timeline" && (

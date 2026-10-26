@@ -8,3 +8,6 @@ dist/
 
 # Local runtime database
 *.db
+
+# Runtime recovery queue data
+resilpay_recovery_queue.json
