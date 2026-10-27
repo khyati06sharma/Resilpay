@@ -254,4 +254,4 @@ ResilPay is an academic demonstration of resilience concepts. Its purpose is to 
 
 ---
 
-**Author:** Add your name and course details here before publishing, if required by your college.
+**Author:** Khyati Sharma | BCA final year | Dezyne Ecole College , Ajmer
