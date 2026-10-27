@@ -58,8 +58,6 @@ _RECOVERY_STAGES = (
 RECOVERY_BACKOFF_SECONDS = (1, 1, 1)
 RECOVERY_DEMO_TARGET_SECONDS = 20
 
-# Operations allowed to wait in the database recovery queue.
-# The recovery_queue.py eligible() function must allow these same routes.
 QUEUEABLE_WRITES = {
     ("POST", "/add-employee"),
 }
@@ -82,7 +80,7 @@ def normalize_path(path):
 
 
 def is_queueable_write(method, path):
-    """Match only explicitly supported employee and payment operations."""
+    
     import re
 
     method = (method or "").upper()
@@ -241,7 +239,7 @@ def database_fault_active():
         )
     except Exception:
         app.logger.exception("Could not read database fault status")
-        # Fail closed: do not allow writes if the fault state is unknown.
+        
         return True
 
 
@@ -330,9 +328,6 @@ def inject_real_network_error():
 
     payload = request.get_json(silent=True) or {}
 
-    # Highest priority: the database fault blocks every route mutation.
-    # Supported operations wait in the queue; unsupported operations fail.
-    # Payments must NEVER be queued or replayed during a database outage.
     is_payment_request = (
         normalized_path == "/payments"
         or normalized_path.startswith("/payments/")
@@ -351,15 +346,13 @@ def inject_real_network_error():
                 "recovery": "Automatic database recovery is in progress."
             }), 503, {"Retry-After": "2"}
 
-        # Only eligible employee operations may be queued.
+        
         return _queue_response(
             request.method, normalized_path, payload, "database"
         )
     with _network_fault_lock:
         network_active = _network_fault_active
 
-    # Network outage: reject writes. The UI should disable its buttons too,
-    # but this backend guard protects direct requests as well.
     if network_active:
         _network_fault_observed.set()
         return jsonify({
@@ -377,7 +370,7 @@ def inject_real_network_error():
     with _state_lock:
         api_active = bool(_chaos.get("api", False))
 
-    # Block employee mutations during an API outage.
+   
     api_mutation = (
         normalized_path == "/add-employee"
         or normalized_path.startswith("/employees/")
@@ -815,8 +808,6 @@ def process_recovery_queue():
             return 0
 
     try:
-        # A queue implementation must record final outcomes and must not
-        # blindly replay an operation whose result is uncertain.
         return queue_process_pending(_replay_queued_request)
     except Exception:
         app.logger.exception("Recovery queue processing failed")
@@ -966,7 +957,7 @@ def chaos_network():
             incident_id,
         )
 
-        # Clear only the injected fault. Actual health must still be checked.
+     
         set_recovery_stage(
             "network",
             "working",
@@ -1239,8 +1230,7 @@ def chaos_database():
 
 
     def recover_database():
-        # Keep the simulated database outage active until the recovery
-        # process reaches its actual restoration step.
+      
         observed = wait_for_database_fault_observed(timeout=8)
 
         if not observed:
@@ -1263,10 +1253,9 @@ def chaos_database():
             incident_id,
         )
 
-        # IMPORTANT: wait BEFORE restoring access, not after it.
+       
         wait_for_minimum_demo_window(incident_started, 15)
 
-        # Restore SQLite access only when the outage window is complete.
         try:
             deactivate_database_fault()
         except Exception:
@@ -1364,8 +1353,7 @@ def make_payment(employee_id, run_id, amount_override=None, payment_method="UPI"
     conn = get_db()
 
     try:
-        # A confirmed payment closes this employee's payroll period. Never
-        # create another attempt once PAID exists for the same period.
+      
         already_paid = conn.execute(
             """SELECT * FROM payments
                WHERE employee_id=?
@@ -1421,9 +1409,7 @@ def make_payment(employee_id, run_id, amount_override=None, payment_method="UPI"
         if provider_failed:
             _payment_fault_observed.set()
 
-        # A simulated gateway timeout is ambiguous: the request may have
-        # reached the provider, so never label it as a definite decline or
-        # automatically retry it. Persist the outcome for reconciliation.
+        
         status = "PENDING_VERIFICATION" if provider_failed else "PAID"
         message = (
             "Gateway timeout: the test processor did not return a confirmation. "

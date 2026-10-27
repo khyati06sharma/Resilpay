@@ -1,5 +1,5 @@
 
-"""Durable queue for employee operations during simulated outages."""
+
 import json
 import os
 import threading

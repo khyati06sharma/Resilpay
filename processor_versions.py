@@ -1,4 +1,4 @@
-"""Local simulated payment processor implementations for ResilPay."""
+
 import threading
 from datetime import datetime, timezone
 

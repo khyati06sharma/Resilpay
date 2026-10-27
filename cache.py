@@ -1,4 +1,4 @@
-"""Small thread-safe last-known-good cache for safe read responses only."""
+
 from collections import OrderedDict
 from threading import RLock
 from time import monotonic

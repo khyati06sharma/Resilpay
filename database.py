@@ -6,8 +6,6 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "resilpay.db"
 
-# Thread-safe, in-process fault injection. Existing connections are unaffected;
-# new connections fail while the fault is active.
 _fault_lock = threading.Lock()
 _database_fault_active = False
 _database_fault_started = None

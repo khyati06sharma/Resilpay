@@ -1,4 +1,4 @@
-"""SQLite-backed automatic processor rollback controller for ResilPay."""
+
 import sqlite3
 import threading
 import time
@@ -153,8 +153,7 @@ def _resume_pending_jobs(incident_id):
         conn.close()
 
     for job in rows:
-        # Mark Processing transactionally before invoking the callback. The
-        # callback checks payments.idempotency_key before creating any record.
+       
         conn = _connect()
         try:
             cur = conn.execute(
@@ -172,8 +171,7 @@ def _resume_pending_jobs(incident_id):
             if status == "PAID":
                 final_status, message = "Completed", "Payment is confirmed in the payments table."
             elif status in ("FAILED", "UNKNOWN", "PROCESSING"):
-                # Never auto-retry an uncertain/failed transaction. Keep it
-                # visible for reconciliation instead of risking a duplicate.
+                
                 final_status, message = "Needs reconciliation", f"Existing transaction status is {status}; no blind retry was attempted."
             else:
                 final_status, message = "Failed", f"Processor returned status {status}."
@@ -233,11 +231,7 @@ def _controller(incident_id, detected_at):
         processor_versions.set_deployment_status("detecting")
         _set_state(deployment_status="detecting")
         _event(incident_id, "health_check", "Running active processor behavior self-test.", "2.0", "info")
-        # Small demo window lets the UI show v2 as active and allows a payroll
-        # request to be safely queued while the faulty implementation is active.
-        # Short demonstration window: gives the admin time to submit a payroll
-        # run while v2 is active so those jobs can be observed as pending.
-        time.sleep(4.0)
+        
         check = processor_versions.health_check()
         _set_state(health=check, active_version=check["version"])
         if check["healthy"]:
